@@ -61,23 +61,52 @@ pi
 
 herdr is the only supported terminal environment. The extension requires `HERDR_ENV=1` and the `herdr` CLI to be available.
 
-If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
+Launches wait for two consecutive foreground-shell observations (50ms apart), then settle for
+100ms. This is a readiness heuristic, not a shell-prompt protocol. Set a minimum delay for slow
+shell-init tools such as direnv; on older servers without process-info the fallback is 500ms.
+A shell that stays observably busy past the timeout is not sent a command; its newly created
+pane is closed and the launch reports an error.
 
 ```bash
-export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
+export PI_SUBAGENT_SHELL_READY_TIMEOUT_MS=8000 # default: 5000
+export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # optional minimum, default: 0 (fallback: 500)
 ```
 
-By default each subagent runs in its **own new tab**. If you'd rather keep them
-side-by-side with the orchestrator, set `PI_SUBAGENT_LAYOUT=split` (right-hand
-split) or `PI_SUBAGENT_LAYOUT=split:down` (split below). Unset, empty, or any
-other value keeps the default new-tab behavior:
+By default each subagent runs in its **own new tab**. Split options:
 
 ```bash
-export PI_SUBAGENT_LAYOUT=split        # right-hand split
-# export PI_SUBAGENT_LAYOUT=split:down # split below
+export PI_SUBAGENT_LAYOUT=split       # right-hand split; split:right is equivalent
+# export PI_SUBAGENT_LAYOUT=split:down
+# export PI_SUBAGENT_LAYOUT=split:auto # right if width >= 2.5 × height, otherwise down
 ```
 
-Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Auto layout measures the caller's pane (not the focused pane); unsupported layout queries fall
+back to right. Unset, empty, or unknown values retain new tabs. All surfaces use the child's
+resolved cwd and `--no-focus`. The `interactive` option controls parent status steers, not focus.
+
+### Optional Herdr integration
+
+These features default **on** and are best-effort with older servers:
+
+- **Agent names:** once detected, children receive a sanitized Herdr name (32 characters max),
+  with a short ID suffix on collision. Completion details include `herdrAgentName`; the initial
+  acknowledgment gives the stable pane target because naming happens asynchronously. Use
+  `herdr agent read <name-or-pane-id>` after detection, not as a polling loop for completion.
+- **Metadata:** children show `<cli> · <role>` and their task; the parent reports `subagents=N running`
+  with monotonic sequence numbers and a 120s TTL (refreshed every 60s). The token is cleared on
+  completion/shutdown. Reports use their own `pi-herdr-subagents` source.
+- **Notifications:** after result delivery, an explicitly unfocused parent gets a completion,
+  failure, or help notification (including interactive children). The body includes the first
+  summary line, at most 120 characters; no notification if focus cannot be determined.
+- **Session verification:** Pi session-path discrepancies are reported as runtime warnings;
+  observed paths never replace the file used to extract results. Herdr idle/done alone is
+  **not** completion evidence; sidecars and exit sentinels remain authoritative.
+
+```bash
+export PI_SUBAGENT_HERDR_AGENT_NAME=0 # disable agent naming
+export PI_SUBAGENT_HERDR_METADATA=0   # disable child and parent metadata
+export PI_SUBAGENT_HERDR_NOTIFY=0     # disable notifications (including summary previews)
+```
 
 ## What's Included
 

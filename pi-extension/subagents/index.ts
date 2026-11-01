@@ -1,4 +1,5 @@
-import { slugifyName } from "./names.ts";
+import { slugifyName, toHerdrAgentName } from "./names.ts";
+import { renameHerdrAgent, reportHerdrPaneMetadataAsync, notifyHerdrCompletion } from "./herdr.ts";
 import { buildPiSubagentEnv } from "./harness/drivers/pi.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
@@ -22,7 +23,7 @@ import {
   runScriptInPaneAsync,
   closePane,
   closePaneAsync,
-  interruptPane,
+  interruptPaneAsync,
   shellQuote,
   readPane,
   readPaneAsync,
@@ -561,6 +562,10 @@ interface RunningSubagent {
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
+  herdrAgentName?: string;
+  observedSessionFile?: string;
+  sessionMismatch?: string;
+  herdrAgentNameAttempted?: boolean;
   activityFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
@@ -596,6 +601,10 @@ interface SubagentRuntime {
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
   agentCatalog?: string;
+  parentPane?: string;
+  metadataSeq?: number;
+  metadataCount?: number;
+  metadataUpdatedAt?: number;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -780,7 +789,18 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   return lines;
 }
 
+function refreshParentMetadata(count = runningSubagents.size, force = false): void {
+  if (!runtime.parentPane || process.env.PI_SUBAGENT_HERDR_METADATA === "0") return;
+  const now = Date.now();
+  if (!force && count === runtime.metadataCount && now - (runtime.metadataUpdatedAt ?? 0) < 60_000) return;
+  runtime.metadataCount = count;
+  runtime.metadataUpdatedAt = now;
+  runtime.metadataSeq = Math.max((runtime.metadataSeq ?? 0) + 1, now * 1000);
+  void reportHerdrPaneMetadataAsync(runtime.parentPane, { subagents: count, seq: runtime.metadataSeq });
+}
+
 function updateWidget() {
+  refreshParentMetadata();
   const latestCtx = runtime.latestCtx;
   if (!latestCtx) return;
   try {
@@ -923,12 +943,12 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
-function requestSubagentInterrupt(
+async function requestSubagentInterrupt(
   running: RunningSubagent,
-  interruptPaneKey: (surface: string) => void = interruptPane,
-): { ok: true } | { error: string } {
+  interruptPaneKey: (surface: string) => void | Promise<void> = interruptPaneAsync,
+): Promise<{ ok: true } | { error: string }> {
   try {
-    interruptPaneKey(running.surface);
+    await interruptPaneKey(running.surface);
     return { ok: true };
   } catch (error: any) {
     return {
@@ -939,9 +959,9 @@ function requestSubagentInterrupt(
   }
 }
 
-function handleSubagentInterrupt(
+async function handleSubagentInterrupt(
   params: { id?: string; name?: string },
-  interruptPaneKey: (surface: string) => void = interruptPane,
+  interruptPaneKey: (surface: string) => void | Promise<void> = interruptPaneAsync,
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -971,7 +991,7 @@ function handleSubagentInterrupt(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const interruption = requestSubagentInterrupt(running, interruptPaneKey);
+  const interruption = await requestSubagentInterrupt(running, interruptPaneKey);
   if ("error" in interruption) {
     return {
       content: [{ type: "text" as const, text: interruption.error }],
@@ -1078,6 +1098,8 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   deliverSubagentCompletion,
+  assignHerdrAgentName,
+  observeHerdrSession,
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
@@ -1159,9 +1181,7 @@ async function launchSubagent(
 
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? await createSubagentSurfaceAsync(params.name, resolveSubagentLayout(), targetCwdForSession);
-  if (params.task) {
-    await setPaneTaskAsync(surface, params.task);
-  }
+  await setPaneTaskAsync(surface, params.task, `${cliId} · ${params.agent ?? params.name}`);
   if (!surfacePreCreated) {
     await waitForShellReady(surface).catch(async (error) => {
       await closePaneAsync(surface).catch(() => {});
@@ -1270,6 +1290,32 @@ async function launchSubagent(
  * the summary from the session file, cleans up the surface,
  * and removes the entry from runningSubagents.
  */
+function observeHerdrSession(running: RunningSubagent, inspection: PaneInspection): void {
+  if (inspection.kind !== "present" || inspection.agentSession?.kind !== "path"
+    || getHarnessDriver(running.cli).id !== "pi" || inspection.agent !== "pi") return;
+  const observed = inspection.agentSession.value;
+  running.observedSessionFile = observed;
+  running.sessionMismatch = resolve(observed) === resolve(running.sessionFile) ? undefined
+    : `Expected session ${running.sessionFile} but Herdr reported ${observed}`;
+}
+
+async function assignHerdrAgentName(
+  running: RunningSubagent,
+  rename = renameHerdrAgent,
+): Promise<void> {
+  if (process.env.PI_SUBAGENT_HERDR_AGENT_NAME === "0" || running.herdrAgentNameAttempted
+    || !shouldDeliverSubagentCompletion(running)) return;
+  running.herdrAgentNameAttempted = true;
+  for (const candidate of [toHerdrAgentName(running.name), toHerdrAgentName(running.name, running.id)]) {
+    if (!shouldDeliverSubagentCompletion(running)) return;
+    try {
+      await rename(running.surface, candidate);
+      running.herdrAgentName = candidate;
+      return;
+    } catch { /* Optional identity; a collision gets one bounded suffix retry. */ }
+  }
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1286,6 +1332,8 @@ async function watchSubagent(
       onPaneInspection: (inspection: PaneInspection, observedAt: number) => {
         ensureLifecycle(running);
         running.lifecycle = observePaneInspection(running.lifecycle, inspection, observedAt);
+        observeHerdrSession(running, inspection);
+        if (inspection.kind === "present" && inspection.agent) void assignHerdrAgentName(running);
         updateWidget();
       },
       onTick() {
@@ -1454,14 +1502,16 @@ function deliverSubagentCompletion(
           ? `Resumed session exited with code ${result.exitCode}` : "Resumed session exited without new output")
       : result.summary;
     const basePresentation = resolveResultPresentation({ ...result, summary, sessionFile }, running.name);
-    const presentation = running.runtimePlan?.runtimeMismatch
-      ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}` : basePresentation;
+    const warnings = [running.runtimePlan?.runtimeMismatch, running.sessionMismatch].filter(Boolean);
+    const presentation = basePresentation + warnings.map((warning) => `\n\nRuntime warning: ${warning}`).join("");
     completionApi.sendMessage({
       customType: "subagent_result",
       content: presentation,
       display: true,
       details: {
         name: running.name, task: running.task, agent: running.agent,
+        surface: running.surface, herdrAgentName: running.herdrAgentName,
+        ...(running.observedSessionFile ? { observedSessionFile: running.observedSessionFile } : {}),
         exitCode: result.exitCode, elapsed: result.elapsed, sessionFile,
         ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
         ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
@@ -1470,6 +1520,11 @@ function deliverSubagentCompletion(
     }, { triggerTurn: true, deliverAs: "steer" });
   }
   running.lifecycle = markDelivery(running.lifecycle, "delivered");
+  if (runtime.parentPane) {
+    void notifyHerdrCompletion(runtime.parentPane, running.name,
+      result.ping ? "needs help" : result.exitCode !== 0 || result.errorMessage ? "failed" : "completed",
+      result.ping?.message ?? result.errorMessage ?? result.summary);
+  }
   runningSubagents.delete(running.id);
   updateWidget();
 }
@@ -1508,6 +1563,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
+    runtime.parentPane = ctx.mode === "tui" && isTerminalAvailable() ? process.env.HERDR_PANE_ID : undefined;
+    refreshParentMetadata(runningSubagents.size, true);
     runtime.modelCatalog = buildAuthenticatedModelCatalog(
       wrapPiModelRegistry(ctx.modelRegistry),
       24,
@@ -1532,6 +1589,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    refreshParentMetadata(0, true);
+    runtime.parentPane = undefined;
     // Preserved watchers must not touch a ctx that is about to go stale.
     runtime.latestCtx = undefined;
     if (widgetInterval) {
@@ -1632,11 +1691,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 `Sub-agent "${params.name}" launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+                `Until then, move on to other work or tell the user you're waiting. ` +
+                `Herdr target (once detected): herdr agent read ${running.herdrAgentName ?? running.surface}.`, 
             },
           ],
           details: {
             id: running.id,
+            surface: running.surface,
+            herdrAgentName: running.herdrAgentName,
             name: params.name,
             task: params.task,
             agent: params.agent,
@@ -1894,9 +1956,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = await createSubagentSurfaceAsync(name, resolveSubagentLayout(), ctx.cwd);
-        if (params.message) {
-          await setPaneTaskAsync(surface, params.message);
-        }
+        await setPaneTaskAsync(surface, params.message ?? "resumed session", `pi · ${name}`);
         await waitForShellReady(surface).catch(async (error) => {
           await closePaneAsync(surface).catch(() => {});
           throw error;

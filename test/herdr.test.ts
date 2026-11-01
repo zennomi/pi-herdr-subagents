@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isShellIdle, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import { notifyHerdrCompletion, sendHerdrEscapeAsync, isShellIdle, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 
 import { slugifyName, toHerdrAgentName } from "../pi-extension/subagents/names.ts";
 
@@ -62,6 +62,64 @@ describe("automatic split geometry", () => {
     assert.equal(resolveAutoSplitDirection(layout, "wide"), "right");
     assert.equal(resolveAutoSplitDirection(layout, "tall"), "down");
     assert.equal(resolveAutoSplitDirection(layout, "missing"), "right");
+  });
+});
+
+describe("agent-aware interrupt", () => {
+  it("uses agent keys and only falls back for explicit unsupported/no-agent errors", async () => {
+    const calls: string[][] = [];
+    await sendHerdrEscapeAsync("w1:p2", async (args) => {
+      calls.push(args);
+      if (args[0] === "agent") throw { stderr: JSON.stringify({ error: { code: "agent_not_found" } }) };
+      return "";
+    });
+    assert.deepEqual(calls, [["agent", "send-keys", "w1:p2", "esc"], ["pane", "send-keys", "w1:p2", "Escape"]]);
+    let attempts = 0;
+    await assert.rejects(sendHerdrEscapeAsync("w1:p2", async () => { attempts++; throw Error("timeout"); }));
+    assert.equal(attempts, 1);
+  });
+});
+
+describe("pane metadata", () => {
+  it("isolates its source, normalizes tasks and expires parent counts", () => {
+    const args = __herdrTest__.buildPaneMetadataArgs("w1:p1", { task: "line1\nline2", displayAgent: "pi · scout", subagents: 2, seq: 99 });
+    assert.ok(args.includes("pi-herdr-subagents"));
+    assert.ok(args.includes("task=line1 line2"));
+    assert.ok(args.includes("pi · scout"));
+    assert.ok(args.includes("subagents=2 running"));
+    assert.equal(args[args.indexOf("--ttl-ms") + 1], "120000");
+    assert.equal(args[args.indexOf("--seq") + 1], "99");
+    const clear = __herdrTest__.buildPaneMetadataArgs("w1:p1", { subagents: 0, seq: 100 });
+    assert.ok(clear.includes("--clear-token"));
+    assert.ok(!clear.includes("--token"));
+  });
+});
+
+describe("completion notifications", () => {
+  it("only notifies an explicitly unfocused parent, once, with bounded content", async () => {
+    for (const focused of [true, false, undefined]) {
+      const calls: string[][] = [];
+      await notifyHerdrCompletion("w1:p1", "Scout", "completed", "x".repeat(160) + "\nprivate second line", async (args) => {
+        calls.push(args);
+        return JSON.stringify({ result: { pane: { pane_id: "w1:p1", focused } } });
+      });
+      assert.equal(calls.length, focused === false ? 2 : 1);
+      if (focused === false) {
+        assert.deepEqual(calls[1], ["notification", "show", "Scout completed", "--body", "x".repeat(120), "--sound", "done"]);
+      }
+    }
+    await notifyHerdrCompletion("w1:p1", "Scout", "failed", "error", async () => { throw Error("offline"); });
+  });
+});
+
+describe("pane session observations", () => {
+  it("parses valid references and ignores malformed optional session data", () => {
+    const parse = (agent_session: unknown) => __herdrTest__.parsePaneGetOutput(JSON.stringify({ result: { pane: { pane_id: "w1:p2", agent: "pi", agent_status: "working", agent_session } } }), "w1:p2");
+    const session = { kind: "path", value: "/child.jsonl", agent: "pi" };
+    assert.deepEqual((parse(session) as any).agentSession, session);
+    for (const invalid of [null, {}, { kind: "path", value: 123 }, { kind: "unknown", value: "abc" }]) {
+      assert.equal((parse(invalid) as any).agentSession, undefined);
+    }
   });
 });
 

@@ -23,6 +23,7 @@ import {
   reportHerdrPaneTask,
   sendHerdrCommand,
   sendHerdrEscape,
+  sendHerdrEscapeAsync,
 } from "./herdr.ts";
 
 export type PaneId = string;
@@ -85,8 +86,8 @@ export async function closePaneAsync(pane: PaneId): Promise<void> {
   await closeHerdrSurfaceAsync(pane);
 }
 
-export async function setPaneTaskAsync(pane: PaneId, task: string): Promise<void> {
-  if (isTerminalAvailable()) await reportHerdrPaneMetadataAsync(pane, task);
+export async function setPaneTaskAsync(pane: PaneId, task: string, displayAgent?: string): Promise<void> {
+  if (isTerminalAvailable()) await reportHerdrPaneMetadataAsync(pane, { task, displayAgent });
 }
 
 function envMilliseconds(value: string | undefined, fallback: number): number {
@@ -176,6 +177,11 @@ export function runInPane(paneId: PaneId, command: string): void {
 export function interruptPane(paneId: PaneId): void {
   assertTerminalAvailable();
   sendHerdrEscape(paneId);
+}
+
+export async function interruptPaneAsync(pane: PaneId): Promise<void> {
+  assertTerminalAvailable();
+  await sendHerdrEscapeAsync(pane);
 }
 
 function writePaneScript(

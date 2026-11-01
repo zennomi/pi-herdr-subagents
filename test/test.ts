@@ -160,6 +160,11 @@ function restoreEnvVar(name: string, value: string | undefined) {
   process.env[name] = value;
 }
 
+async function withTempDirAsync(fn: (dir: string) => Promise<void>): Promise<void> {
+  const dir = createTestDir();
+  try { await fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
 function withMockedNow<T>(now: number, fn: () => T): T {
   const originalNow = Date.now;
   Date.now = () => now;
@@ -2211,6 +2216,30 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("cross-checks Pi session paths without following foreign paths or warning for other CLIs", () => {
+    const running: any = { sessionFile: "/expected.jsonl" };
+    const inspection: any = { kind: "present", agent: "pi", agentSession: { kind: "path", value: "/observed.jsonl" } };
+    subagentsModule.__test__.observeHerdrSession(running, inspection);
+    assert.equal(running.sessionFile, "/expected.jsonl");
+    assert.equal(running.observedSessionFile, "/observed.jsonl");
+    assert.match(running.sessionMismatch, /Herdr reported/);
+    inspection.agentSession.value = "/expected.jsonl";
+    subagentsModule.__test__.observeHerdrSession(running, inspection);
+    assert.equal(running.sessionMismatch, undefined);
+    inspection.agentSession.value = "/other.jsonl";
+    running.cli = "claude";
+    subagentsModule.__test__.observeHerdrSession(running, inspection);
+    assert.equal(running.sessionMismatch, undefined);
+  });
+  it("assigns a Herdr agent name once, with a bounded collision retry", async () => {
+    const running: any = { id: "abcdef12", name: "Review", surface: "w1:p2", lifecycle: createLifecycle(0) };
+    const calls: string[] = [];
+    const rename = async (_pane: string, name: string) => { calls.push(name); if (name === "review") throw Error("collision"); };
+    await subagentsModule.__test__.assignHerdrAgentName(running, rename);
+    await subagentsModule.__test__.assignHerdrAgentName(running, rename);
+    assert.deepEqual(calls, ["review", "review-abcd"]);
+    assert.equal(running.herdrAgentName, "review-abcd");
+  });
   it("shares exactly-once delivery for spawn, resume and ping", () => {
     withTempDir((dir) => {
       const { api, sentMessages } = createMockExtensionApi();
@@ -2468,7 +2497,7 @@ describe("subagent activity snapshots", () => {
   });
 });
 
-describe("subagent interruption", () => {
+describe("subagent interruption", async () => {
   function makeRunning(overrides: Record<string, unknown> = {}) {
     return {
       id: "a1",
@@ -2483,7 +2512,7 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_interrupt in the main session extension", () => {
+  it("registers subagent_interrupt in the main session extension", async () => {
     const { api, registeredTools } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
@@ -2491,7 +2520,7 @@ describe("subagent interruption", () => {
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
   });
 
-  it("resolves interrupt targets by exact id and reports name ambiguity", () => {
+  it("resolves interrupt targets by exact id and reports name ambiguity", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2511,7 +2540,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("returns an explicit error when Escape delivery fails", () => {
+  it("returns an explicit error when Escape delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     let aborted = false;
     const running = makeRunning({
@@ -2522,7 +2551,7 @@ describe("subagent interruption", () => {
       },
     });
 
-    const result = testApi.requestSubagentInterrupt(running, () => {
+    const result = await testApi.requestSubagentInterrupt(running, async () => {
       throw new Error("mux write failed");
     });
 
@@ -2531,7 +2560,7 @@ describe("subagent interruption", () => {
     assert.equal("interruptRequested" in running, false);
   });
 
-  it("leaves status unchanged when Escape delivery fails in the tool path", () => {
+  it("leaves status unchanged when Escape delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2563,7 +2592,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-      const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+      const result = await withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, async () => {
         throw new Error("mux write failed");
       }));
 
@@ -2574,7 +2603,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("sends Escape without aborting or mutating running state", () => {
+  it("sends Escape without aborting or mutating running state", async () => {
     const testApi = (subagentsModule as any).__test__;
     let aborted = false;
     let sentSurface = "";
@@ -2586,7 +2615,7 @@ describe("subagent interruption", () => {
       },
     });
 
-    const result = testApi.requestSubagentInterrupt(running, (surface: string) => {
+    const result = await testApi.requestSubagentInterrupt(running, (surface: string) => {
       sentSurface = surface;
     });
 
@@ -2596,13 +2625,13 @@ describe("subagent interruption", () => {
     assert.equal("interruptRequested" in running, false);
   });
 
-  it("refreshes the latest activity snapshot before forcing local interrupt waiting", () => {
+  it("refreshes the latest activity snapshot before forcing local interrupt waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
     runningMap.clear();
 
-    withTempDir((dir) => {
+    await withTempDirAsync(async (dir) => {
       mkdirSync(join(dir, "subagent-activity"), { recursive: true });
       const activityFile = getSubagentActivityFile(dir, "a1");
       const activity = {
@@ -2626,7 +2655,7 @@ describe("subagent interruption", () => {
       try {
         runningMap.set("a1", makeRunning({ activityFile }));
 
-        withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+        await withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
           sentSurface = surface;
         }));
 
@@ -2643,7 +2672,7 @@ describe("subagent interruption", () => {
     });
   });
 
-  it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
+  it("acknowledges Pi-backed interrupt requests and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2676,7 +2705,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-      const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      const result = await withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
         sentSurface = surface;
       }));
 
@@ -2691,7 +2720,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("sends Escape again for repeated interrupt requests", () => {
+  it("sends Escape again for repeated interrupt requests", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     const surfaces: string[] = [];
@@ -2700,10 +2729,10 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning());
 
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      await testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
         surfaces.push(surface);
       });
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      await testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
         surfaces.push(surface);
       });
 
@@ -2714,7 +2743,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("rejects Claude-backed interrupt requests before delivery", () => {
+  it("rejects Claude-backed interrupt requests before delivery", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let delivered = false;
@@ -2723,7 +2752,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ cli: "claude" }));
 
-      const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+      const result = await testApi.handleSubagentInterrupt({ name: "Worker" }, async () => {
         delivered = true;
       });
 
@@ -2739,7 +2768,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("formats exit code 130 as an ordinary failure", () => {
+  it("formats exit code 130 as an ordinary failure", async () => {
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
       {
@@ -2756,7 +2785,7 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Resume: pi --session/);
   });
 
-  it("renders a clear provider/agent error when errorMessage is set", () => {
+  it("renders a clear provider/agent error when errorMessage is set", async () => {
     // Previously, an overload retry-exhaustion produced exitCode 0 with a
     // stale summary — the orchestrator thought the subagent finished
     // quickly. With the error sidecar plumbed through, the presentation
