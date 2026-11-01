@@ -124,7 +124,15 @@ export async function waitForShellReady(pane: PaneId, options: { timeoutMs?: num
     idleSamples = isShellIdle(info) ? idleSamples + 1 : 0;
     if (idleSamples >= 2) {
       await deps.delay(Math.max(settle, floor - (deps.now() - started)));
-      return;
+      // Shell startup can briefly return to its own process group between jobs.
+      // Recheck after settling rather than sending into a newly started init job.
+      try {
+        if (isShellIdle(await deps.inspect(pane, 1000))) return;
+      } catch {
+        await deps.delay(Math.max(0, fallback - (deps.now() - started)));
+        return;
+      }
+      idleSamples = 0;
     }
     await deps.delay(Math.min(50, Math.max(0, timeout - (deps.now() - started))));
   }

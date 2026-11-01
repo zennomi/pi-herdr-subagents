@@ -33,7 +33,7 @@ describe("shell readiness", () => {
   });
   it("waits for two consecutive idle samples, settle time and configured floor", async () => {
     let now = 0;
-    const samples = [idle, busy, idle, idle];
+    const samples = [idle, busy, idle, idle, idle];
     await waitForShellReady("w1:p2", {}, {
       inspect: async () => samples.shift()!, now: () => now,
       delay: async (ms) => { now += ms; }, env: { PI_SUBAGENT_SHELL_READY_DELAY_MS: "2500" },
