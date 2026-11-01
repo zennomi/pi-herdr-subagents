@@ -529,11 +529,11 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Alt+J` or `/subagent-tools`. `Ctrl+J` remains available for inserting a newline:
 
 ```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
+[scout] — 12 tools · 4 denied  (Alt+J)              ← collapsed
+[scout] — 12 available  (Alt+J to collapse)          ← expanded
   read, bash, edit, write, todo, ...
   denied: subagent, subagents_list, ...
 ```
@@ -542,7 +542,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
-- [pi](https://github.com/earendil-works/pi) 1.3.x, minimum 1.3.0. The extension is tested on this line only.
+- [pi](https://github.com/earendil-works/pi) 1.4.x, minimum 1.4.0. The extension is tested on this line only.
 - [herdr](https://herdr.dev) — the required terminal workspace
 
 ```bash

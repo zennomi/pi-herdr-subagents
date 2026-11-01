@@ -1508,6 +1508,19 @@ describe("subagent-done.ts", () => {
     });
   });
 
+  it("uses Alt+J and a command without stealing Ctrl+J", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    const shortcuts: Array<{ key: string; handler: Function }> = [];
+    api.registerShortcut = (key: string, def: any) => shortcuts.push({ key, ...def });
+    subagentDoneExtension(api);
+    assert.deepEqual(shortcuts.map((s) => s.key), ["alt+j"]);
+    let updates = 0;
+    const ctx = { ui: { setWidget: () => updates++ } };
+    shortcuts[0].handler(ctx);
+    await registeredCommands.find((c) => c.name === "subagent-tools").handler("", ctx);
+    assert.equal(updates, 2);
+  });
+
   describe("auto-exit lifecycle", () => {
     it("waits for agent_settled and uses the latest agent result", () => {
       withTempDir((dir) => {
@@ -2036,7 +2049,7 @@ describe("commands", () => {
     const iterate = registeredCommands.find((command) => command.name === "iterate");
     assert.ok(iterate, "expected /iterate to be registered");
 
-    iterate.handler("Fix the bug", {});
+    iterate.handler("Fix the bug", { isIdle: () => true });
 
     assert.equal(sentUserMessages.length, 1);
     assert.match(sentUserMessages[0], /fork: true/);
@@ -2046,6 +2059,30 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("queues command messages only when the session is busy", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    const calls: any[] = [];
+    api.sendUserMessage = (message: string, options: any) => calls.push({ message, options });
+    subagentsModule.default(api);
+    for (const name of ["iterate", "subagent"]) {
+      const command = registeredCommands.find((c) => c.name === name);
+      for (const idle of [true, false]) {
+        await command.handler(name === "subagent" ? "scout inspect" : "inspect", { isIdle: () => idle });
+        assert.deepEqual(calls.at(-1).options, idle ? undefined : { deliverAs: "followUp" });
+      }
+    }
+    assert.equal(calls.length, 4);
+  });
+  it("keeps tool prompt snippets short and distinct from descriptions", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+    assert.equal(registeredTools.length, 4);
+    for (const tool of registeredTools) {
+      assert.notEqual(tool.promptSnippet, tool.description);
+      assert.ok(tool.promptSnippet.length < 120);
+      assert.ok(!tool.promptSnippet.includes("\n"));
+    }
+  });
   it("advertises named agents and tells callers to preserve their runtime defaults", async () => {
     const [{ prompt }] = await captureGuidanceRequests();
     assert.match(prompt, /Available named subagents/);
@@ -2107,6 +2144,27 @@ describe("tool registration", () => {
       autoExit: false,
       interactive: true,
     });
+  });
+
+  it("resolves relative agent frontmatter cwd against the project root", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const root = "/tmp/example-project";
+
+    const fromAgent = testApi.resolveSubagentPaths({}, { cwd: "./vat-ly-ai-frontend" }, root);
+    assert.equal(fromAgent.effectiveCwd, "/tmp/example-project/vat-ly-ai-frontend");
+
+    const fromParam = testApi.resolveSubagentPaths(
+      { cwd: "agents/sre" },
+      { cwd: "./ignored" },
+      root,
+    );
+    assert.equal(fromParam.effectiveCwd, "/tmp/example-project/agents/sre");
+
+    const absolute = testApi.resolveSubagentPaths({}, { cwd: "/opt/backend" }, root);
+    assert.equal(absolute.effectiveCwd, "/opt/backend");
+
+    const none = testApi.resolveSubagentPaths({}, null, root);
+    assert.equal(none.effectiveCwd, null);
   });
 
   it("expands spawning false to deny subagent interruption", () => {

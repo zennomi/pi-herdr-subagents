@@ -14,13 +14,13 @@
   "type": "module",
   "scripts": {
     "lint": "oxlint pi-extension test",
-    "test": "node --test test/test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts test/claude-completion.test.ts test/guidance-delivery.test.ts",
+    "test": "node --test test/test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts test/claude-completion.test.ts test/guidance-delivery.test.ts test/herdr.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "~1.3.0",
-    "@earendil-works/pi-coding-agent": "~1.3.0",
-    "@earendil-works/pi-tui": "~1.3.0",
+    "@earendil-works/pi-ai": "~1.4.0",
+    "@earendil-works/pi-coding-agent": "~1.4.0",
+    "@earendil-works/pi-tui": "~1.4.0",
     "@sinclair/typebox": "*"
   },
   "pi": {
@@ -29,9 +29,9 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "~1.3.0",
-    "@earendil-works/pi-coding-agent": "~1.3.0",
-    "@earendil-works/pi-tui": "~1.3.0",
+    "@earendil-works/pi-ai": "~1.4.0",
+    "@earendil-works/pi-coding-agent": "~1.4.0",
+    "@earendil-works/pi-tui": "~1.4.0",
     "@sinclair/typebox": "^0.34.52",
     "oxlint": "^1.73.0"
   }
