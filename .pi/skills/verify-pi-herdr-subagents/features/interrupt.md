@@ -26,7 +26,7 @@ Preconditions: healthy baseline; Pi-backed child actively executing a long task.
 
 - A shell sleep interrupted with Ctrl+C does not prove `subagent_interrupt`. Do not replace the real Pi task with that stand-in.
 - The helper's generic `send` does not wait; capture only after checking the real active-task precondition.
-- Escape interrupts the Pi turn; it does not promise to roll back already completed file writes or external work. Record observed side effects, including the STARTED marker.
+- Escape interrupts the Pi turn; it does not promise to roll back already completed file writes or external work. Record observed side effects, including the STARTED marker. It is not idempotent: repeating Escape in an idle Pi can open navigation UI. Do not blindly retry.
 - This tool supports Pi-backed children, not Claude or arbitrary CLI children. Name ambiguity is an error; use the returned exact child ID if necessary.
 - Interactive tracking suppresses stall/recovery steers, not explicit completion delivery. Observe the child directly and clean up the owned workspace afterward.
 - Tool interrupts prefer `herdr agent send-keys <pane> esc`; only explicit no-agent/unsupported errors permit the legacy pane fallback. Transport failures must not retry input.

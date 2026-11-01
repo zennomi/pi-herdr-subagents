@@ -1601,10 +1601,19 @@ interface DeliveryOptions {
   entryCountBefore?: number;
 }
 
+function completionSummary(running: RunningSubagent, result: SubagentResult, options: DeliveryOptions): string {
+  return options.kind === "resume"
+    ? findLastAssistantMessage(getNewEntries(running.sessionFile, options.entryCountBefore ?? 0)) ??
+      (result.errorMessage ? `Subagent error: ${result.errorMessage}` : result.exitCode !== 0
+        ? `Resumed session exited with code ${result.exitCode}` : "Resumed session exited without new output")
+    : result.summary;
+}
+
 function completionMessage(
   running: RunningSubagent,
   result: SubagentResult,
   options: DeliveryOptions,
+  summary: string,
 ): Parameters<ExtensionAPI["sendMessage"]>[0] {
   const sessionFile = result.sessionFile ?? (options.kind === "resume" ? running.sessionFile : undefined);
   if (result.ping) {
@@ -1616,11 +1625,6 @@ function completionMessage(
       details: { name: result.ping.name, message: result.ping.message, agent: running.agent, sessionFile },
     };
   } else {
-    const summary = options.kind === "resume"
-      ? findLastAssistantMessage(getNewEntries(running.sessionFile, options.entryCountBefore ?? 0)) ??
-        (result.errorMessage ? `Subagent error: ${result.errorMessage}` : result.exitCode !== 0
-          ? `Resumed session exited with code ${result.exitCode}` : "Resumed session exited without new output")
-      : result.summary;
     const basePresentation = resolveResultPresentation({ ...result, summary, sessionFile }, running.name);
     const warnings = [running.runtimePlan?.runtimeMismatch, running.sessionMismatch].filter(Boolean);
     const presentation = basePresentation + warnings.map((warning) => `\n\nRuntime warning: ${warning}`).join("");
@@ -1654,7 +1658,8 @@ function flushSubagentCompletion(running: RunningSubagent, deps = defaultDepende
     try {
       if (!shouldDeliverSubagentCompletion(running) || runtime.readyApi !== api || runtime.pi !== api) return;
       running.lastDeliveryApi = api;
-      await api.sendMessage(completionMessage(running, result, options), { triggerTurn: true, deliverAs: "steer" });
+      const summary = completionSummary(running, result, options);
+      await api.sendMessage(completionMessage(running, result, options, summary), { triggerTurn: true, deliverAs: "steer" });
       if (!shouldDeliverSubagentCompletion(running)) return;
       running.lifecycle = markDelivery(running.lifecycle, "delivered");
       running.pendingCompletion = undefined;
@@ -1664,7 +1669,7 @@ function flushSubagentCompletion(running: RunningSubagent, deps = defaultDepende
         try {
           await deps.notifyHerdrCompletion(runtime.parentPane, running.name,
             result.ping ? "needs help" : result.exitCode !== 0 || result.errorMessage ? "failed" : "completed",
-            result.ping?.message ?? result.errorMessage ?? result.summary);
+            result.ping?.message ?? summary);
         } catch { /* Optional notification must not retry an accepted result. */ }
       }
     } catch (error) {
@@ -1926,7 +1931,8 @@ export default function subagentsExtension(pi: ExtensionAPI, dependencies: Parti
   if (shouldRegister("subagent_interrupt"))
     pi.registerTool({
       name: "subagent_interrupt",
-      annotations: { destructiveHint: false, idempotentHint: true },
+      // Escape also affects an idle Pi UI; repeating it is not idempotent.
+      annotations: { destructiveHint: false, idempotentHint: false },
       label: "Interrupt Subagent",
       description:
         "Send Escape to the active turn of a currently running Pi-backed subagent. " +

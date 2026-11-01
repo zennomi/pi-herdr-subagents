@@ -2072,7 +2072,7 @@ describe("tool registration", () => {
     assert.deepEqual(annotations("subagents_list"), { readOnlyHint: true, openWorldHint: false });
     assert.equal(annotations("subagent").openWorldHint, true);
     assert.equal(annotations("subagent_resume").readOnlyHint, false);
-    assert.equal(annotations("subagent_interrupt").idempotentHint, true);
+    assert.equal(annotations("subagent_interrupt").idempotentHint, false);
   });
   it("provides schema-valid data and explicit errors for programmatic callers", async () => {
     const { api, registeredTools } = createMockExtensionApi();

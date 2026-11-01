@@ -240,6 +240,26 @@ describe("watcher delivery across replacement runtimes", () => {
     }
   }
 
+  for (const newOutput of [false, true]) {
+    it(`resume notification matches delivery with new output=${newOutput}`, async () => {
+      await withHarness(async (h) => {
+        const notifications: any[] = [];
+        const api = h.load({ notifyHerdrCompletion: async (...args: any[]) => { notifications.push(args); } });
+        await api.start();
+        const running = runningFrom(await api.launch("resume"));
+        __test__.runtime.parentPane = "mock-parent";
+        if (newOutput) appendFileSync(running.sessionFile, assistantEntry("resumed answer"));
+        h.completion.resolve({ reason: "done", exitCode: 0 });
+        await running.watcher;
+        const expected = newOutput ? "resumed answer" : "Resumed session exited without new output";
+        assert.equal(notifications.length, 1);
+        assert.equal(notifications[0][3], expected);
+        assert.ok(api.messages[0].message.content.includes(expected));
+        assert.ok(!api.messages[0].message.content.includes("old output"));
+      });
+    });
+  }
+
   for (const failure of ["throw", "reject"]) {
     it(`contains sendMessage ${failure}, keeps the original result and only retries on a replacement API`, async () => {
       await withHarness(async (h) => {
