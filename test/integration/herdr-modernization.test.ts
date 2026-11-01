@@ -45,7 +45,20 @@ describe("async Herdr surfaces [real server, no LLM]", { skip: getAvailableBacke
       env.surfaces.push(pane);
       await waitForShellReady(pane, { timeoutMs: 8000 });
       const childExtension = fileURLToPath(new URL("../../pi-extension/subagents/subagent-done.ts", import.meta.url));
-      const command = ["pi", "-ne", "-e", childExtension, "--no-skills", "--no-context-files", "--approve", "--model", TEST_MODEL,
+      const editorProof = join(env.dir, "editor-proof.json");
+      const probe = join(env.dir, "editor-probe.ts");
+      // Observe the real editor through Pi's API; never substitute a test editor.
+      // A mistaken submit is counted and handled so the no-LLM test stays offline.
+      writeFileSync(probe, `import { writeFileSync } from "node:fs";
+export default function (pi) {
+  let submittedInputs = 0;
+  pi.on("input", () => { submittedInputs++; return { action: "handled" }; });
+  pi.registerShortcut("alt+x", { description: "Capture editor proof", handler: async (ctx) => {
+    writeFileSync(${JSON.stringify(editorProof)}, JSON.stringify({ editor: ctx.ui.getEditorText(), submittedInputs }));
+  } });
+}
+`);
+      const command = ["pi", "-ne", "-e", childExtension, "-e", probe, "--no-skills", "--no-context-files", "--approve", "--model", TEST_MODEL,
         "--session", join(env.dir, "ui.jsonl")].map(shellQuote).join(" ");
       await runScriptInPaneAsync(pane, "PI_SUBAGENT_NAME=verify-ui PI_SUBAGENT_AUTO_EXIT=0 " + command, { scriptPath: join(env.dir, "ui-launch.sh") });
       await waitForScreen(pane, /Alt\+J to expand/, 15000);
@@ -59,7 +72,13 @@ describe("async Herdr surfaces [real server, no LLM]", { skip: getAvailableBacke
       herdr("pane", "send-text", pane, "EDITOR_LINE_TWO");
       const screen = await waitForScreen(pane, /EDITOR_LINE_TWO/, 5000);
       const lines = screen.split("\n");
-      assert.ok(lines.findIndex((line) => line.includes("EDITOR_LINE_TWO")) > lines.findIndex((line) => line.includes("EDITOR_LINE_ONE")));
+      const first = lines.findIndex((line) => line.includes("EDITOR_LINE_ONE"));
+      const second = lines.findIndex((line) => line.includes("EDITOR_LINE_TWO"));
+      assert.ok(first >= 0 && second > first, "both editor markers must be visible on separate lines");
+      herdr("agent", "send-keys", name, "alt+x");
+      const proof = JSON.parse(await waitForFile(editorProof, 5000));
+      assert.equal(proof.editor, "EDITOR_LINE_ONE\nEDITOR_LINE_TWO");
+      assert.equal(proof.submittedInputs, 0, "Ctrl+J must not submit an input turn");
       herdr("agent", "send-keys", name, "ctrl+c");
       herdr("pane", "run", pane, "/subagent-tools");
       await waitForScreen(pane, /Alt\+J to expand/, 5000);
