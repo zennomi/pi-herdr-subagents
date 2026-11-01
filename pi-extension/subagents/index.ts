@@ -618,11 +618,27 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** Completion survives the reload gap, including resume extraction options. */
+  pendingCompletion?: { result: SubagentResult; options: DeliveryOptions };
+  deliveryAttempt?: Promise<void>;
+  lastDeliveryApi?: ExtensionAPI;
+  deliveryError?: string;
+  watcher?: Promise<void>;
+}
+
+interface PaneCleanup {
+  pending?: Promise<void>;
+  retry?: ReturnType<typeof setTimeout>;
+  error?: string;
 }
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
   pi?: ExtensionAPI;
+  readyApi?: ExtensionAPI;
+  launchGeneration?: number;
+  sessionId?: string;
+  paneCleanups?: Map<string, PaneCleanup>;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
   agentCatalog?: string;
@@ -649,7 +665,7 @@ export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
 
 export function cleanupSubagentsForShutdown(
   reason: unknown,
-  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle">>,
+  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle" | "pendingCompletion">>,
 ): void {
   if (shouldPreserveSubagentsOnShutdown(reason)) return;
 
@@ -657,6 +673,7 @@ export function cleanupSubagentsForShutdown(
     if (agent.lifecycle) {
       agent.lifecycle = markDelivery(agent.lifecycle, "suppressed");
     }
+    agent.pendingCompletion = undefined;
     agent.abortController?.abort();
   }
   agents.clear();
@@ -670,8 +687,80 @@ export function shouldDeliverSubagentCompletion(
   return (running.lifecycle?.delivery ?? "pending") === "pending";
 }
 
-export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
-  return current ?? previous;
+// Injectable I/O boundaries shared by the real spawn/resume/watcher paths.
+const defaultDependencies = {
+  isTerminalAvailable,
+  createSubagentSurfaceAsync,
+  setPaneTaskAsync,
+  waitForShellReady,
+  runScriptInPaneAsync,
+  closePaneAsync,
+  getHarnessDriver,
+  writeFileSync,
+  waitForCompletion,
+  notifyHerdrCompletion,
+};
+type SubagentDependencies = typeof defaultDependencies;
+
+/** Failed closes remain supervised across reload; only close is ever retried. */
+function closeOwnedPane(surface: string, deps: SubagentDependencies): Promise<void> {
+  const cleanups = runtime.paneCleanups ??= new Map();
+  const cleanup: PaneCleanup = cleanups.get(surface) ?? {};
+  cleanups.set(surface, cleanup);
+  if (cleanup.pending) return cleanup.pending;
+  if (cleanup.retry) clearTimeout(cleanup.retry);
+  cleanup.pending = Promise.resolve().then(async () => {
+    try {
+      await deps.closePaneAsync(surface);
+      cleanups.delete(surface);
+    } catch (error) {
+      cleanup.error = String(error);
+      cleanup.retry = setTimeout(() => { void closeOwnedPane(surface, deps); }, 1000);
+      cleanup.retry.unref();
+    } finally {
+      cleanup.pending = undefined;
+    }
+  });
+  return cleanup.pending;
+}
+
+/** Own the pane until it is either supervised by a watcher or closed. */
+async function launchInOwnedPane(
+  name: string,
+  task: string,
+  displayAgent: string,
+  cwd: string,
+  sessionId: string,
+  deps: SubagentDependencies,
+  options: DeliveryOptions,
+  buildAndSubmit: (surface: string, assertCurrent: () => void) => Promise<RunningSubagent>,
+): Promise<RunningSubagent> {
+  const generation = runtime.launchGeneration;
+  const assertCurrent = () => {
+    if (runtime.launchGeneration !== generation || !runtime.readyApi
+      || runtime.readyApi !== runtime.pi || runtime.sessionId !== sessionId) {
+      throw new Error("Subagent launch cancelled: parent session changed or reloaded");
+    }
+  };
+  assertCurrent();
+  const surface = await deps.createSubagentSurfaceAsync(name, resolveSubagentLayout(), cwd);
+  try {
+    assertCurrent();
+    await deps.setPaneTaskAsync(surface, task, displayAgent);
+    assertCurrent();
+    await deps.waitForShellReady(surface);
+    assertCurrent();
+    const running = await buildAndSubmit(surface, assertCurrent);
+    assertCurrent();
+    runningSubagents.set(running.id, running);
+    attachWatcher(running, deps, options);
+    return running;
+  } catch (error) {
+    // A pane-run timeout is ambiguous: it may already have launched the child.
+    // Never submit again. Close the owned surface, retaining cleanup on failure.
+    await closeOwnedPane(surface, deps);
+    throw error;
+  }
 }
 
 // ── Widget management ──
@@ -822,7 +911,7 @@ function refreshParentMetadata(count = runningSubagents.size, force = false): vo
   runtime.metadataCount = count;
   runtime.metadataUpdatedAt = now;
   runtime.metadataSeq = Math.max((runtime.metadataSeq ?? 0) + 1, now * 1000);
-  void reportHerdrPaneMetadataAsync(runtime.parentPane, { subagents: count, seq: runtime.metadataSeq });
+  void reportHerdrPaneMetadataAsync(runtime.parentPane, { subagents: count, seq: runtime.metadataSeq }).catch(() => {});
 }
 
 function clearWidget(): void {
@@ -1102,15 +1191,18 @@ function startStatusRefresh(pi: ExtensionAPI) {
 
     if (transitionLines.length > 0) {
       const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
-      pi.sendMessage(
-        {
-          customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
-          display: true,
-          details: { lines: capped.visibleLines, overflow: capped.overflow },
-        },
-        { triggerTurn: true, deliverAs: "steer" },
-      );
+      void Promise.resolve().then(() => {
+        if (runtime.readyApi !== pi) return;
+        return pi.sendMessage(
+          {
+            customType: "subagent_status",
+            content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+            display: true,
+            details: { lines: capped.visibleLines, overflow: capped.overflow },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+      }).catch(() => {});
     }
   }, 1000);
 
@@ -1164,9 +1256,7 @@ function startWidgetRefresh() {
 
 /**
  * Launch a subagent: creates the herdr pane, builds the command, and
- * sends it. Returns a RunningSubagent — does NOT poll.
- *
- * Call watchSubagent() on the returned object to observe completion.
+ * submits it once, and attaches supervision before returning.
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
@@ -1182,7 +1272,7 @@ async function launchSubagent(
     };
   },
   parentThinking: ThinkingLevel,
-  options?: { surface?: string },
+  deps: SubagentDependencies,
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1224,113 +1314,104 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   const cliId = agentDefs?.cli ?? "pi";
-  const driver = getHarnessDriver(cliId);
+  const driver = deps.getHarnessDriver(cliId);
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? await createSubagentSurfaceAsync(params.name, resolveSubagentLayout(), targetCwdForSession);
-  await setPaneTaskAsync(surface, params.task, `${cliId} · ${params.agent ?? params.name}`);
-  if (!surfacePreCreated) {
-    await waitForShellReady(surface).catch(async (error) => {
-      await closePaneAsync(surface).catch(() => {});
-      throw error;
+  return launchInOwnedPane(params.name, params.task, `${cliId} · ${params.agent ?? params.name}`,
+    targetCwdForSession, sessionId, deps, { kind: "spawn" }, async (surface, assertCurrent) => {
+      const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+
+      if (launchBehavior.seededSessionMode) {
+        seedSubagentSessionFile({
+          mode: launchBehavior.seededSessionMode,
+          parentSessionFile: sessionFile,
+          childSessionFile: subagentSessionFile,
+          childCwd: targetCwdForSession,
+        });
+      }
+
+      const activityFile = getSubagentActivityFile(artifactDir, id);
+      if (driver.hasActivitySnapshots) {
+        mkdirSync(dirname(activityFile), { recursive: true });
+      }
+      const { inheritsConversationContext } = launchBehavior;
+
+      // Build the task message
+      // Only full-context fork mode inherits prior conversation state.
+      // Blank-session modes need the wrapper instructions and artifact-backed handoff.
+      const modeHint = effectiveAutoExit
+        ? "Complete your task autonomously."
+        : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
+      const summaryInstruction = effectiveAutoExit
+        ? "Your FINAL assistant message should summarize what you accomplished."
+        : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+      const denySet = resolveDenyTools(agentDefs);
+      const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+      const systemPromptMode = agentDefs?.systemPromptMode;
+      const identityInSystemPrompt = systemPromptMode && identity;
+      const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
+      const effectiveModel = driver.formatModel(runtimePlan);
+
+      const built = driver.buildCommand({
+        params: { ...params, id },
+        agentDefs,
+        runtimePlan,
+        effectiveModel,
+        effectiveThinking,
+        parentThinking,
+        surface,
+        artifactDir,
+        sessionDir,
+        subagentSessionFile,
+        effectiveCwd,
+        localAgentDir,
+        effectiveAutoExit,
+        effectiveInteractive,
+        inheritsConversationContext,
+        taskDelivery: launchBehavior.taskDelivery,
+        denySet,
+        identity,
+        identityInSystemPrompt: Boolean(identityInSystemPrompt),
+        systemPromptMode,
+        roleBlock,
+        modeHint,
+        summaryInstruction,
+        subagentsDir: SUBAGENTS_DIR,
+        shellQuote,
+      });
+
+      const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
+      const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+
+      assertCurrent();
+      await deps.runScriptInPaneAsync(surface, built.command, {
+        scriptPath: launchScriptFile,
+        scriptPreamble: (built.launchScriptPreamble ?? [
+          `# Subagent launch script for ${params.name}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${surface}`,
+        ]).join("\n"),
+      });
+
+      return {
+        id,
+        name: params.name,
+        task: params.task,
+        agent: params.agent,
+        surface,
+        startTime,
+        sessionFile: built.sessionFile ?? subagentSessionFile,
+        launchScriptFile,
+        cli: built.cli,
+        sentinelFile: built.sentinelFile,
+        interactive: effectiveInteractive,
+        runtimePlan,
+        activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
+        lifecycle: !driver.hasActivitySnapshots
+          ? markProcessRunning(createLifecycle(startTime), Date.now())
+          : createLifecycle(startTime),
+      };
     });
-  }
-
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-
-  if (launchBehavior.seededSessionMode) {
-    seedSubagentSessionFile({
-      mode: launchBehavior.seededSessionMode,
-      parentSessionFile: sessionFile,
-      childSessionFile: subagentSessionFile,
-      childCwd: targetCwdForSession,
-    });
-  }
-
-  const activityFile = getSubagentActivityFile(artifactDir, id);
-  if (driver.hasActivitySnapshots) {
-    mkdirSync(dirname(activityFile), { recursive: true });
-  }
-  const { inheritsConversationContext } = launchBehavior;
-
-  // Build the task message
-  // Only full-context fork mode inherits prior conversation state.
-  // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = effectiveAutoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = effectiveAutoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-  const systemPromptMode = agentDefs?.systemPromptMode;
-  const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const effectiveModel = driver.formatModel(runtimePlan);
-
-  const built = driver.buildCommand({
-    params: { ...params, id },
-    agentDefs,
-    runtimePlan,
-    effectiveModel,
-    effectiveThinking,
-    parentThinking,
-    surface,
-    artifactDir,
-    sessionDir,
-    subagentSessionFile,
-    effectiveCwd,
-    localAgentDir,
-    effectiveAutoExit,
-    effectiveInteractive,
-    inheritsConversationContext,
-    taskDelivery: launchBehavior.taskDelivery,
-    denySet,
-    identity,
-    identityInSystemPrompt: Boolean(identityInSystemPrompt),
-    systemPromptMode,
-    roleBlock,
-    modeHint,
-    summaryInstruction,
-    subagentsDir: SUBAGENTS_DIR,
-    shellQuote,
-  });
-
-  const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
-  const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-  await runScriptInPaneAsync(surface, built.command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: (built.launchScriptPreamble ?? [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Surface: ${surface}`,
-    ]).join("\n"),
-  });
-
-  const running: RunningSubagent = {
-    id,
-    name: params.name,
-    task: params.task,
-    agent: params.agent,
-    surface,
-    startTime,
-    sessionFile: built.sessionFile ?? subagentSessionFile,
-    launchScriptFile,
-    cli: built.cli,
-    sentinelFile: built.sentinelFile,
-    interactive: effectiveInteractive,
-    runtimePlan,
-    activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
-    lifecycle: !driver.hasActivitySnapshots
-      ? markProcessRunning(createLifecycle(startTime), Date.now())
-      : createLifecycle(startTime),
-  };
-
-  runningSubagents.set(id, running);
-  return running;
 }
 
 /**
@@ -1367,11 +1448,12 @@ async function assignHerdrAgentName(
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  deps: SubagentDependencies,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await waitForCompletion(signal, {
+    const result = await deps.waitForCompletion(signal, {
       intervalMs: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1381,7 +1463,7 @@ async function watchSubagent(
         ensureLifecycle(running);
         running.lifecycle = observePaneInspection(running.lifecycle, inspection, observedAt);
         observeHerdrSession(running, inspection);
-        if (inspection.kind === "present" && inspection.agent) void assignHerdrAgentName(running);
+        if (inspection.kind === "present" && inspection.agent) void assignHerdrAgentName(running).catch(() => {});
         updateWidget();
       },
       onTick() {
@@ -1394,7 +1476,7 @@ async function watchSubagent(
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
 
-    const driver = getHarnessDriver(running.cli);
+    const driver = deps.getHarnessDriver(running.cli);
     if (driver.extractResult) {
       const extracted = await driver.extractResult({
         running,
@@ -1406,7 +1488,6 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        await closePaneAsync(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1468,7 +1549,6 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    await closePaneAsync(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1484,9 +1564,6 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
-    try {
-      await closePaneAsync(surface);
-    } catch {}
     running.lifecycle = markFailed(
       running.lifecycle,
       signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
@@ -1514,6 +1591,8 @@ async function watchSubagent(
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
     };
+  } finally {
+    await closeOwnedPane(surface, deps);
   }
 }
 
@@ -1522,27 +1601,20 @@ interface DeliveryOptions {
   entryCountBefore?: number;
 }
 
-function deliverSubagentCompletion(
+function completionMessage(
   running: RunningSubagent,
   result: SubagentResult,
-  options: DeliveryOptions = { kind: "spawn" },
-  previousApi: ExtensionAPI = runtime.pi!,
-): void {
-  if (!shouldDeliverSubagentCompletion(running)) {
-    runningSubagents.delete(running.id);
-    updateWidget();
-    return;
-  }
-  const completionApi = selectCompletionApi(previousApi, runtime.pi);
+  options: DeliveryOptions,
+): Parameters<ExtensionAPI["sendMessage"]>[0] {
   const sessionFile = result.sessionFile ?? (options.kind === "resume" ? running.sessionFile : undefined);
   if (result.ping) {
     const sessionRef = `\n\nSession: ${sessionFile}\nResume: pi --session ${sessionFile}`;
-    completionApi.sendMessage({
+    return {
       customType: "subagent_ping",
       content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
       display: true,
       details: { name: result.ping.name, message: result.ping.message, agent: running.agent, sessionFile },
-    }, { triggerTurn: true, deliverAs: "steer" });
+    };
   } else {
     const summary = options.kind === "resume"
       ? findLastAssistantMessage(getNewEntries(running.sessionFile, options.entryCountBefore ?? 0)) ??
@@ -1552,7 +1624,7 @@ function deliverSubagentCompletion(
     const basePresentation = resolveResultPresentation({ ...result, summary, sessionFile }, running.name);
     const warnings = [running.runtimePlan?.runtimeMismatch, running.sessionMismatch].filter(Boolean);
     const presentation = basePresentation + warnings.map((warning) => `\n\nRuntime warning: ${warning}`).join("");
-    completionApi.sendMessage({
+    return {
       customType: "subagent_result",
       content: presentation,
       display: true,
@@ -1565,51 +1637,93 @@ function deliverSubagentCompletion(
         ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
         ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
       },
-    }, { triggerTurn: true, deliverAs: "steer" });
+    };
   }
-  running.lifecycle = markDelivery(running.lifecycle, "delivered");
-  if (runtime.parentPane) {
-    void notifyHerdrCompletion(runtime.parentPane, running.name,
-      result.ping ? "needs help" : result.exitCode !== 0 || result.errorMessage ? "failed" : "completed",
-      result.ping?.message ?? result.errorMessage ?? result.summary);
-  }
-  runningSubagents.delete(running.id);
-  updateWidget();
+}
+
+function flushSubagentCompletion(running: RunningSubagent, deps = defaultDependencies): Promise<void> {
+  if (running.deliveryAttempt) return running.deliveryAttempt.then(() => flushSubagentCompletion(running, deps));
+  const api = runtime.readyApi;
+  if (!shouldDeliverSubagentCompletion(running) || !running.pendingCompletion
+    || !api || api !== runtime.pi || running.lastDeliveryApi === api) return Promise.resolve();
+
+  // One attempt per initialized API, not a retry loop against an invalid runtime.
+  // A failed send keeps the original result until a replacement session_start.
+  const { result, options } = running.pendingCompletion;
+  running.deliveryAttempt = Promise.resolve().then(async () => {
+    try {
+      if (!shouldDeliverSubagentCompletion(running) || runtime.readyApi !== api || runtime.pi !== api) return;
+      running.lastDeliveryApi = api;
+      await api.sendMessage(completionMessage(running, result, options), { triggerTurn: true, deliverAs: "steer" });
+      if (!shouldDeliverSubagentCompletion(running)) return;
+      running.lifecycle = markDelivery(running.lifecycle, "delivered");
+      running.pendingCompletion = undefined;
+      running.deliveryError = undefined;
+      runningSubagents.delete(running.id);
+      if (runtime.parentPane) {
+        try {
+          await deps.notifyHerdrCompletion(runtime.parentPane, running.name,
+            result.ping ? "needs help" : result.exitCode !== 0 || result.errorMessage ? "failed" : "completed",
+            result.ping?.message ?? result.errorMessage ?? result.summary);
+        } catch { /* Optional notification must not retry an accepted result. */ }
+      }
+    } catch (error) {
+      running.deliveryError = String(error);
+    } finally {
+      running.deliveryAttempt = undefined;
+      try { updateWidget(); } catch { /* Presentation cannot reject a watcher. */ }
+    }
+  });
+  return running.deliveryAttempt;
+}
+
+async function deliverSubagentCompletion(
+  running: RunningSubagent,
+  result: SubagentResult,
+  options: DeliveryOptions = { kind: "spawn" },
+  deps = defaultDependencies,
+): Promise<void> {
+  if (!shouldDeliverSubagentCompletion(running)) return;
+  running.pendingCompletion ??= { result, options };
+  await flushSubagentCompletion(running, deps);
 }
 
 function attachWatcher(
   running: RunningSubagent,
-  pi: ExtensionAPI,
+  deps: SubagentDependencies,
   options: DeliveryOptions = { kind: "spawn" },
 ): void {
   const watcherAbort = new AbortController();
   running.abortController = watcherAbort;
-  startWidgetRefresh();
-  startStatusRefresh(pi);
-  void watchSubagent(running, watcherAbort.signal)
-    .then((result) => deliverSubagentCompletion(running, result, options, pi))
-    .catch((err) => {
-      if (shouldDeliverSubagentCompletion(running)) {
-        selectCompletionApi(pi, runtime.pi).sendMessage({
-          customType: "subagent_result",
-          content: options.kind === "resume" ? `Resume error: ${err?.message ?? String(err)}`
-            : `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-          display: true,
-          details: { name: running.name, task: running.task, exitCode: 1, error: err?.message },
-        }, { triggerTurn: true, deliverAs: "steer" });
-        running.lifecycle = markDelivery(running.lifecycle, "delivered");
-      }
-      runningSubagents.delete(running.id);
-      updateWidget();
-    });
+  running.watcher = (async () => {
+    let result: SubagentResult;
+    try {
+      startWidgetRefresh();
+      startStatusRefresh(runtime.readyApi!);
+      result = await watchSubagent(running, watcherAbort.signal, deps);
+    } catch (error) {
+      // Also contain failures outside watchSubagent's polling/extraction guard.
+      await closeOwnedPane(running.surface, deps);
+      result = { name: running.name, task: running.task, summary: `Subagent error: ${String(error)}`,
+        sessionFile: running.sessionFile, exitCode: 1, elapsed: Math.floor((Date.now() - running.startTime) / 1000) };
+      running.lifecycle = markFailed(running.lifecycle, result.summary, Date.now(), 1);
+    }
+    await deliverSubagentCompletion(running, result, options, deps);
+  })();
 }
 
-export default function subagentsExtension(pi: ExtensionAPI) {
+export default function subagentsExtension(pi: ExtensionAPI, dependencies: Partial<SubagentDependencies> = {}) {
+  const deps = { ...defaultDependencies, ...dependencies };
   runtime.pi = pi;
+  runtime.readyApi = undefined;
+  runtime.launchGeneration = (runtime.launchGeneration ?? 0) + 1;
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
+    runtime.pi = pi;
+    runtime.readyApi = pi;
+    runtime.sessionId = ctx.sessionManager.getSessionId();
     runtime.latestCtx = ctx;
     runtime.parentPane = ctx.mode === "tui" && isTerminalAvailable() ? process.env.HERDR_PANE_ID : undefined;
     refreshParentMetadata(runningSubagents.size, true);
@@ -1626,6 +1740,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       startStatusRefresh(pi);
       updateWidget();
     }
+    await Promise.all(Array.from(runningSubagents.values(), (running) => flushSubagentCompletion(running, deps)));
   });
 
   pi.on("before_agent_start", (event) => {
@@ -1637,6 +1752,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    runtime.readyApi = undefined;
+    runtime.launchGeneration = (runtime.launchGeneration ?? 0) + 1;
     clearWidget();
     refreshParentMetadata(0, true);
     runtime.parentPane = undefined;
@@ -1692,7 +1809,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Validate prerequisites
-        if (!isTerminalAvailable()) {
+        if (!deps.isTerminalAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -1713,9 +1830,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ) {
           throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
         }
-        const running = await launchSubagent(params, ctx, parentThinking);
-
-        attachWatcher(running, pi);
+        const running = await launchSubagent(params, ctx, parentThinking, deps);
 
         // Return immediately
         return {
@@ -1993,7 +2108,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
-        if (!isTerminalAvailable()) {
+        if (!deps.isTerminalAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -2004,78 +2119,72 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = await createSubagentSurfaceAsync(name, resolveSubagentLayout(), ctx.cwd);
-        await setPaneTaskAsync(surface, params.message ?? "resumed session", `pi · ${name}`);
-        await waitForShellReady(surface).catch(async (error) => {
-          await closePaneAsync(surface).catch(() => {});
-          throw error;
-        });
-
-        // Build pi resume command
-        const parts = ["pi", "--session", shellQuote(params.sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellQuote(subagentDonePath));
-
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
-        const activityFile = getSubagentActivityFile(artifactDir, id);
-        mkdirSync(dirname(activityFile), { recursive: true });
+        const running = await launchInOwnedPane(name, params.message ?? "resumed session", `pi · ${name}`,
+          ctx.cwd, sessionId, deps, { kind: "resume", entryCountBefore }, async (surface, assertCurrent) => {
+            // Build pi resume command
+            const parts = ["pi", "--session", shellQuote(params.sessionPath)];
 
-        let resumeMsgFile: string | undefined;
-        if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${slugifyName(name, "resume")}-${msgTimestamp}.md`,
-          );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, params.message, "utf8");
-          parts.push(shellQuote(`@${resumeMsgFile}`));
-        }
+            // Load subagent-done extension so the agent can self-terminate if needed
+            const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+            parts.push("-e", shellQuote(subagentDonePath));
 
-        // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-        const resumeEnvParts = buildPiSubagentEnv({
-          name, sessionFile: params.sessionPath, id, activityFile, surface, autoExit,
-          agentDir: process.env.PI_CODING_AGENT_DIR, quote: shellQuote,
-        });
-        const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
+            const activityFile = getSubagentActivityFile(artifactDir, id);
+            mkdirSync(dirname(activityFile), { recursive: true });
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-        const launchScriptFile = join(
-          artifactDir,
-          "subagent-scripts",
-          `${slugifyName(name, "resume")}-resume-${Date.now()}.sh`,
-        );
-        await runScriptInPaneAsync(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+            let resumeMsgFile: string | undefined;
+            if (params.message) {
+              const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+              resumeMsgFile = join(
+                artifactDir,
+                "subagent-resume",
+                `${slugifyName(name, "resume")}-${msgTimestamp}.md`,
+              );
+              mkdirSync(dirname(resumeMsgFile), { recursive: true });
+              deps.writeFileSync(resumeMsgFile, params.message, "utf8");
+              parts.push(shellQuote(`@${resumeMsgFile}`));
+            }
 
-        // Register as a running subagent for widget tracking
-        const running: RunningSubagent = {
-          id,
-          name,
-          task: params.message ?? "resumed session",
-          surface,
-          startTime,
-          sessionFile: params.sessionPath,
-          launchScriptFile,
-          activityFile,
-          interactive,
-          runtimePlan: undefined,
-          lifecycle: createLifecycle(startTime),
-        };
-        runningSubagents.set(id, running);
-        attachWatcher(running, pi, { kind: "resume", entryCountBefore });
+            // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
+            const resumeEnvParts = buildPiSubagentEnv({
+              name, sessionFile: params.sessionPath, id, activityFile, surface, autoExit,
+              agentDir: process.env.PI_CODING_AGENT_DIR, quote: shellQuote,
+            });
+            const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
+
+            const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+            const launchScriptFile = join(
+              artifactDir,
+              "subagent-scripts",
+              `${slugifyName(name, "resume")}-resume-${Date.now()}.sh`,
+            );
+            assertCurrent();
+            await deps.runScriptInPaneAsync(surface, command, {
+              scriptPath: launchScriptFile,
+              scriptPreamble: [
+                `# Subagent resume script for ${name}`,
+                `# Generated: ${new Date().toISOString()}`,
+                `# Session: ${params.sessionPath}`,
+                `# Surface: ${surface}`,
+                ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+              ].join("\n"),
+            });
+
+            return {
+              id,
+              name,
+              task: params.message ?? "resumed session",
+              surface,
+              startTime,
+              sessionFile: params.sessionPath,
+              launchScriptFile,
+              activityFile,
+              interactive,
+              runtimePlan: undefined,
+              lifecycle: createLifecycle(startTime),
+            };
+          });
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
@@ -2084,7 +2193,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             id,
             name,
             sessionPath: params.sessionPath,
-            launchScriptFile,
+            launchScriptFile: running.launchScriptFile,
             status: "started",
           },
         };

@@ -1,4 +1,5 @@
 import { describe, it, before, after } from "node:test";
+import "./launch-reload.test.ts";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -10,7 +11,6 @@ import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { captureGuidanceRequests } from "./guidance-session.ts";
 import {
   cleanupSubagentsForShutdown,
-  selectCompletionApi,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
 } from "../pi-extension/subagents/index.ts";
@@ -2268,11 +2268,12 @@ describe("subagent parent lifecycle", () => {
     assert.deepEqual(calls, ["review", "review-abcd"]);
     assert.equal(running.herdrAgentName, "review-abcd");
   });
-  it("shares exactly-once delivery for spawn, resume and ping", () => {
-    withTempDir((dir) => {
+  it("shares exactly-once delivery for spawn, resume and ping", async () => {
+    await withTempDirAsync(async (dir) => {
       const { api, sentMessages } = createMockExtensionApi();
       subagentsModule.default(api);
       const helpers = subagentsModule.__test__;
+      helpers.runtime.readyApi = api;
       const sessionFile = createSessionFile(dir, [
         { type: "message", message: { role: "assistant", content: [{ type: "text", text: "old" }] } },
         { type: "message", message: { role: "assistant", content: [{ type: "text", text: "new" }] } },
@@ -2283,9 +2284,9 @@ describe("subagent parent lifecycle", () => {
         const result = { name: kind, task: "task", summary: "spawn output", elapsed: 1, exitCode: 0, sessionFile,
           ...(kind === "ping" ? { ping: { name: kind, message: "help" } } : {}) };
         const options = { kind: kind === "resume" ? "resume" as const : "spawn" as const, entryCountBefore: 1 };
-        helpers.deliverSubagentCompletion(running, result, options);
+        await helpers.deliverSubagentCompletion(running, result, options);
         const count = sentMessages.length;
-        helpers.deliverSubagentCompletion(running, result, options);
+        await helpers.deliverSubagentCompletion(running, result, options);
         assert.equal(sentMessages.length, count);
         assert.equal(helpers.runningSubagents.has(kind), false);
         assert.match(sentMessages.at(-1).message.content, kind === "resume" ? /new/ : kind === "ping" ? /help/ : /spawn output/);
@@ -2344,13 +2345,6 @@ describe("subagent parent lifecycle", () => {
     assert.equal(shouldDeliverSubagentCompletion({} as any), true);
   });
 
-  it("delivers completion through the reloaded extension API", () => {
-    const previous = { id: "previous" };
-    const current = { id: "current" };
-
-    assert.equal(selectCompletionApi(previous, current), current);
-    assert.equal(selectCompletionApi(previous, undefined), previous);
-  });
 });
 
 describe("subagent activity snapshots", () => {
