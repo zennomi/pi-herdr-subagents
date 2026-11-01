@@ -125,6 +125,39 @@ const ThinkingLevelSchema = Type.Union(
   },
 );
 
+const ToolErrorSchema = Type.Object({ status: Type.Literal("error"), error: Type.String(), id: Type.Optional(Type.String()), name: Type.Optional(Type.String()) });
+const StartedSchema = Type.Union([
+  Type.Object({
+    id: Type.String(), name: Type.String(), status: Type.Literal("started"), sessionFile: Type.String(), surface: Type.String(),
+    launchScriptFile: Type.Optional(Type.String()), herdrAgentName: Type.Optional(Type.String()),
+    agent: Type.Optional(Type.String()), model: Type.Optional(Type.String()), thinking: Type.Optional(Type.String()),
+  }),
+  ToolErrorSchema,
+]);
+const InterruptSchema = Type.Union([
+  Type.Object({ id: Type.String(), name: Type.String(), status: Type.Literal("interrupt_requested") }),
+  ToolErrorSchema,
+]);
+const AgentListSchema = Type.Object({ agents: Type.Array(Type.Object({
+  name: Type.String(), source: Type.Union([Type.Literal("package"), Type.Literal("global"), Type.Literal("project")]),
+  description: Type.Optional(Type.String()), model: Type.Optional(Type.String()), thinking: Type.Optional(Type.String()),
+})) });
+
+function toolError(text: string, error = text) {
+  return { content: [{ type: "text" as const, text }], details: { error },
+    isError: true, structuredContent: { status: "error" as const, error } };
+}
+
+function startedContent(running: RunningSubagent) {
+  return {
+    id: running.id, name: running.name, status: "started" as const, sessionFile: running.sessionFile, surface: running.surface,
+    ...(running.launchScriptFile ? { launchScriptFile: running.launchScriptFile } : {}),
+    ...(running.herdrAgentName ? { herdrAgentName: running.herdrAgentName } : {}),
+    ...(running.agent ? { agent: running.agent } : {}),
+    ...(running.runtimePlan ? { model: running.runtimePlan.model, thinking: running.runtimePlan.thinking } : {}),
+  };
+}
+
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
@@ -479,15 +512,7 @@ function formatElapsed(seconds: number): string {
 }
 
 function muxUnavailableResult() {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: `Subagents require herdr. ${terminalSetupHint()}`,
-      },
-    ],
-    details: { error: "herdr not available" },
-  };
+  return toolError(`Subagents require herdr. ${terminalSetupHint()}`, "herdr not available");
 }
 
 /**
@@ -601,6 +626,7 @@ interface SubagentRuntime {
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
   agentCatalog?: string;
+  widget?: { ctx: ExtensionContext; requestRender?: () => void; status?: string };
   parentPane?: string;
   metadataSeq?: number;
   metadataCount?: number;
@@ -799,21 +825,38 @@ function refreshParentMetadata(count = runningSubagents.size, force = false): vo
   void reportHerdrPaneMetadataAsync(runtime.parentPane, { subagents: count, seq: runtime.metadataSeq });
 }
 
+function clearWidget(): void {
+  const binding = runtime.widget;
+  runtime.widget = undefined;
+  if (!binding) return;
+  try {
+    if (binding.ctx.mode === "tui" && binding.ctx.hasUI) {
+      binding.ctx.ui.setWidget("subagent-status", undefined);
+      binding.ctx.ui.setStatus("subagents", undefined);
+    }
+  } catch { /* Session replacement invalidates old UI contexts. */ }
+}
+
+function ensureWidget(ctx: ExtensionContext): NonNullable<SubagentRuntime["widget"]> {
+  if (runtime.widget?.ctx === ctx) return runtime.widget;
+  clearWidget();
+  const binding: NonNullable<SubagentRuntime["widget"]> = { ctx };
+  runtime.widget = binding;
+  ctx.ui.setWidget("subagent-status", (tui) => {
+    binding.requestRender = () => tui.requestRender();
+    return {
+      invalidate() {}, // Render reads current lifecycle state; no theme-dependent cache.
+      render: (width: number) => renderSubagentWidgetLines(Array.from(runningSubagents.values()), width),
+      dispose() { binding.requestRender = undefined; },
+    };
+  }, { placement: "aboveEditor" });
+  return binding;
+}
+
 function updateWidget() {
   refreshParentMetadata();
-  const latestCtx = runtime.latestCtx;
-  if (!latestCtx) return;
-  try {
-    if (!latestCtx.hasUI) return;
-  } catch {
-    // Ctx went stale (session replacement / reload) mid-flight. Drop it and
-    // wait for the next session_start to install a fresh one.
-    runtime.latestCtx = undefined;
-    return;
-  }
-
   if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
+    clearWidget();
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -821,19 +864,21 @@ function updateWidget() {
     }
     return;
   }
-
-  latestCtx.ui.setWidget(
-    "subagent-status",
-    (_tui: any, _theme: any) => {
-      return {
-        invalidate() {},
-        render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
-        },
-      };
-    },
-    { placement: "aboveEditor" },
-  );
+  const ctx = runtime.latestCtx;
+  if (!ctx) return;
+  try {
+    if (ctx.mode !== "tui" || !ctx.hasUI) return;
+    const binding = ensureWidget(ctx);
+    const status = `⧗ ${runningSubagents.size} subagents`;
+    if (binding.status !== status) {
+      ctx.ui.setStatus("subagents", status);
+      binding.status = status;
+    }
+    binding.requestRender?.();
+  } catch {
+    clearWidget();
+    if (runtime.latestCtx === ctx) runtime.latestCtx = undefined;
+  }
 }
 
 /**
@@ -1100,6 +1145,9 @@ export const __test__ = {
   deliverSubagentCompletion,
   assignHerdrAgentName,
   observeHerdrSession,
+  updateWidget,
+  runtime,
+  startedContent,
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
@@ -1589,6 +1637,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    clearWidget();
     refreshParentMetadata(0, true);
     runtime.parentPane = undefined;
     // Preserved watchers must not touch a ctx that is about to go stale.
@@ -1621,6 +1670,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   if (shouldRegister("subagent"))
     pi.registerTool({
       name: "subagent",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal herdr pane. " +
@@ -1632,20 +1682,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       promptSnippet: "Spawn an async sub-agent in a herdr pane; its result arrives later as a steer message.",
       promptGuidelines: subagentRoutingGuidelines,
       parameters: SubagentParams,
+      outputSchema: StartedSchema,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `You are the ${currentAgent} agent — do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.`,
-              },
-            ],
-            details: { error: "self-spawn blocked" },
-          };
+          return toolError(`You are the ${currentAgent} agent — do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.`, "self-spawn blocked");
         }
 
         // Validate prerequisites
@@ -1654,15 +1697,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         if (!ctx.sessionManager.getSessionFile()) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Error: no session file. Start pi with a persistent session to use subagents.",
-              },
-            ],
-            details: { error: "no session file" },
-          };
+          return toolError("Error: no session file. Start pi with a persistent session to use subagents.", "no session file");
         }
 
         // Launch the subagent (creates pane, sends command)
@@ -1695,6 +1730,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 `Herdr target (once detected): herdr agent read ${running.herdrAgentName ?? running.surface}.`, 
             },
           ],
+          structuredContent: startedContent(running),
           details: {
             id: running.id,
             surface: running.surface,
@@ -1775,19 +1811,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   if (shouldRegister("subagent_interrupt"))
     pi.registerTool({
       name: "subagent_interrupt",
+      annotations: { destructiveHint: false, idempotentHint: true },
       label: "Interrupt Subagent",
       description:
         "Send Escape to the active turn of a currently running Pi-backed subagent. " +
         "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
         "and does not emit a subagent_result solely because of this request.",
       promptSnippet: "Interrupt the active turn of a running Pi-backed subagent.",
+      outputSchema: InterruptSchema,
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
       }),
 
       async execute(_toolCallId, params) {
-        return handleSubagentInterrupt(params);
+        const result = await handleSubagentInterrupt(params);
+        const details = result.details;
+        const failed = "error" in details;
+        return { ...result, isError: failed,
+          structuredContent: failed ? { ...details, status: "error" as const } : details };
+
       },
 
       renderCall(args, theme) {
@@ -1824,12 +1867,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   if (shouldRegister("subagents_list"))
     pi.registerTool({
       name: "subagents_list",
+      annotations: { readOnlyHint: true, openWorldHint: false },
       label: "List Subagents",
       description:
         "List all available subagent definitions. " +
         "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
         "Project-local agents override global ones with the same name.",
       promptSnippet: "List available named subagent definitions.",
+      outputSchema: AgentListSchema,
       parameters: Type.Object({}),
 
       async execute() {
@@ -1839,6 +1884,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return {
             content: [{ type: "text", text: "No subagent definitions found." }],
             details: { agents: [] },
+            structuredContent: { agents: [] },
           };
         }
 
@@ -1852,6 +1898,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: { agents: list },
+          structuredContent: { agents: list.map((agent) => ({
+            name: agent.name, source: agent.source,
+            ...(agent.description ? { description: agent.description } : {}),
+            ...(resolveModelDefault(agent.name, agent.model, modelConfig) ? { model: resolveModelDefault(agent.name, agent.model, modelConfig)! } : {}),
+            ...(agent.thinking ? { thinking: agent.thinking } : {}),
+          })) },
         };
       },
 
@@ -1877,6 +1929,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   if (shouldRegister("subagent_resume"))
     pi.registerTool({
       name: "subagent_resume",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
       label: "Resume Subagent",
       description:
         "Resume a previous sub-agent session in a new herdr pane. " +
@@ -1886,6 +1939,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet: "Resume a previous sub-agent session in a herdr pane (async, result steered back).",
+      outputSchema: StartedSchema,
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
@@ -1944,12 +1998,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         if (!existsSync(params.sessionPath)) {
-          return {
-            content: [
-              { type: "text", text: `Error: session file not found: ${params.sessionPath}` },
-            ],
-            details: { error: "session not found" },
-          };
+          return toolError(`Error: session file not found: ${params.sessionPath}`, "session not found");
         }
 
         // Record entry count before resuming so we can extract new messages
@@ -2030,6 +2079,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
+          structuredContent: startedContent(running),
           details: {
             id,
             name,

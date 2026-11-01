@@ -3,7 +3,7 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Alt+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
@@ -89,7 +89,8 @@ export default function (pi: ExtensionAPI) {
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
 
-  function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
+  function renderWidget(ctx: ExtensionContext, _theme: any) {
+    if (ctx.mode !== "tui" || !ctx.hasUI) return;
     ctx.ui.setWidget(
       "subagent-tools",
       (_tui: any, theme: any) => {

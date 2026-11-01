@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { Value } from "@sinclair/typebox/value";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { captureGuidanceRequests } from "./guidance-session.ts";
@@ -1520,7 +1521,7 @@ describe("subagent-done.ts", () => {
     subagentDoneExtension(api);
     assert.deepEqual(shortcuts.map((s) => s.key), ["alt+j"]);
     let updates = 0;
-    const ctx = { ui: { setWidget: () => updates++ } };
+    const ctx = { mode: "tui", hasUI: true, ui: { setWidget: () => updates++ } };
     shortcuts[0].handler(ctx);
     await registeredCommands.find((c) => c.name === "subagent-tools").handler("", ctx);
     assert.equal(updates, 2);
@@ -2064,6 +2065,33 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("declares tool side-effect annotations", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const annotations = (name: string) => registeredTools.find((t) => t.name === name).annotations;
+    assert.deepEqual(annotations("subagents_list"), { readOnlyHint: true, openWorldHint: false });
+    assert.equal(annotations("subagent").openWorldHint, true);
+    assert.equal(annotations("subagent_resume").readOnlyHint, false);
+    assert.equal(annotations("subagent_interrupt").idempotentHint, true);
+  });
+  it("provides schema-valid data and explicit errors for programmatic callers", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const list = registeredTools.find((t) => t.name === "subagents_list");
+    const listed = await list.execute();
+    assert.ok(Value.Check(list.outputSchema, listed.structuredContent));
+    assert.ok(listed.structuredContent.agents.length > 0);
+    const interrupt = registeredTools.find((t) => t.name === "subagent_interrupt");
+    const missing = await interrupt.execute("test", { id: "not-running" });
+    assert.equal(missing.isError, true);
+    assert.equal(missing.structuredContent.status, "error");
+    assert.ok(Value.Check(interrupt.outputSchema, missing.structuredContent));
+    const running: any = { id: "abc", name: "test", sessionFile: "/a.jsonl", surface: "w1:p2" };
+    for (const name of ["subagent", "subagent_resume"]) {
+      const tool = registeredTools.find((t) => t.name === name);
+      assert.ok(Value.Check(tool.outputSchema, subagentsModule.__test__.startedContent(running)));
+    }
+  });
   it("queues command messages only when the session is busy", async () => {
     const { api, registeredCommands } = createMockExtensionApi();
     const calls: any[] = [];
@@ -2921,6 +2949,35 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
+  it("registers once, requests renders, clears footer and ignores RPC UI", () => {
+    const helpers = subagentsModule.__test__;
+    const previous = helpers.runtime.latestCtx;
+    const widgets: any[] = [], statuses: any[] = [];
+    let renders = 0;
+    const ctx: any = { mode: "tui", hasUI: true, ui: {
+      setWidget: (_key: string, factory: any) => { widgets.push(factory); factory?.({ requestRender: () => renders++ }); },
+      setStatus: (_key: string, value: any) => statuses.push(value),
+    } };
+    try {
+      helpers.runtime.latestCtx = ctx;
+      helpers.runningSubagents.set("widget-test", { id: "widget-test", lifecycle: createLifecycle(0) } as any);
+      helpers.updateWidget(); helpers.updateWidget(); helpers.updateWidget();
+      assert.equal(widgets.length, 1);
+      assert.equal(renders, 3);
+      assert.deepEqual(statuses, ["⧗ 1 subagents"]);
+      helpers.runningSubagents.clear(); helpers.updateWidget();
+      assert.equal(widgets.at(-1), undefined);
+      assert.equal(statuses.at(-1), undefined);
+      const calls = widgets.length;
+      helpers.runtime.latestCtx = { ...ctx, mode: "rpc" };
+      helpers.runningSubagents.set("widget-test", { lifecycle: createLifecycle(0) } as any);
+      helpers.updateWidget();
+      assert.equal(widgets.length, calls);
+    } finally {
+      helpers.runningSubagents.clear(); helpers.updateWidget();
+      helpers.runtime.latestCtx = previous;
+    }
+  });
   it("projects Claude agents as running and counts them as active", () => {
     const testApi = (subagentsModule as any).__test__;
     const originalNow = Date.now;
