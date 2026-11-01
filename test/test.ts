@@ -2211,6 +2211,31 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("shares exactly-once delivery for spawn, resume and ping", () => {
+    withTempDir((dir) => {
+      const { api, sentMessages } = createMockExtensionApi();
+      subagentsModule.default(api);
+      const helpers = subagentsModule.__test__;
+      const sessionFile = createSessionFile(dir, [
+        { type: "message", message: { role: "assistant", content: [{ type: "text", text: "old" }] } },
+        { type: "message", message: { role: "assistant", content: [{ type: "text", text: "new" }] } },
+      ]);
+      for (const kind of ["spawn", "resume", "ping"] as const) {
+        const running: any = { id: kind, name: kind, task: "task", sessionFile, lifecycle: createLifecycle(0) };
+        helpers.runningSubagents.set(kind, running);
+        const result = { name: kind, task: "task", summary: "spawn output", elapsed: 1, exitCode: 0, sessionFile,
+          ...(kind === "ping" ? { ping: { name: kind, message: "help" } } : {}) };
+        const options = { kind: kind === "resume" ? "resume" as const : "spawn" as const, entryCountBefore: 1 };
+        helpers.deliverSubagentCompletion(running, result, options);
+        const count = sentMessages.length;
+        helpers.deliverSubagentCompletion(running, result, options);
+        assert.equal(sentMessages.length, count);
+        assert.equal(helpers.runningSubagents.has(kind), false);
+        assert.match(sentMessages.at(-1).message.content, kind === "resume" ? /new/ : kind === "ping" ? /help/ : /spawn output/);
+      }
+      assert.equal(sentMessages.length, 3);
+    });
+  });
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
     const agents = new Map([["child", {
