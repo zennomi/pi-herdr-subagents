@@ -3,6 +3,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   closeHerdrSurface,
+  closeHerdrSurfaceAsync,
+  createHerdrSurfaceAsync,
+  createHerdrSurfaceSplitAsync,
+  sendHerdrCommandAsync,
+  reportHerdrPaneMetadataAsync,
+  getPaneProcessInfo,
+  isShellIdle,
+  getPaneLayout,
+  type PaneLayout,
   createHerdrSurface,
   createHerdrSurfaceSplit,
   isHerdrAvailable,
@@ -25,7 +34,7 @@ export type SplitDirection = "right" | "down";
  *   - `"right"` — split the orchestrator pane to the right
  *   - `"down"`  — split the orchestrator pane below
  */
-export type SubagentLayout = "tab" | SplitDirection;
+export type SubagentLayout = "tab" | "auto" | SplitDirection;
 
 const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
 
@@ -39,6 +48,7 @@ export function parseSubagentLayout(raw?: string): SubagentLayout {
   const value = (raw ?? "").trim();
   if (value === "split" || value === "split:right") return "right";
   if (value === "split:down") return "down";
+  if (value === "split:auto") return "auto";
   return "tab";
 }
 
@@ -50,7 +60,74 @@ export function resolveSubagentLayout(env: Record<string, string | undefined> = 
 /** Create the surface for a subagent according to the requested layout. */
 export function createSubagentSurface(name: string, layout: SubagentLayout = "tab", cwd = process.cwd()): PaneId {
   assertTerminalAvailable();
-  return layout === "tab" ? createSubagentPane(name, cwd) : splitCurrentPane(name, layout, cwd);
+  return layout === "tab" ? createSubagentPane(name, cwd) : splitCurrentPane(name, layout === "auto" ? "right" : layout, cwd);
+}
+
+export async function createSubagentSurfaceAsync(name: string, layout: SubagentLayout = "tab", cwd = process.cwd()): Promise<PaneId> {
+  assertTerminalAvailable();
+  if (layout === "tab") return createHerdrSurfaceAsync(name, cwd);
+  let direction: SplitDirection = layout === "auto" ? "right" : layout;
+  if (layout === "auto" && process.env.HERDR_PANE_ID) {
+    try { direction = resolveAutoSplitDirection(await getPaneLayout(process.env.HERDR_PANE_ID), process.env.HERDR_PANE_ID); }
+    catch { /* Older servers: retain right-hand splits. */ }
+  }
+  return createHerdrSurfaceSplitAsync(name, direction, cwd);
+}
+
+export function resolveAutoSplitDirection(layout: PaneLayout, pane = process.env.HERDR_PANE_ID): SplitDirection {
+  const rect = layout.panes.find((item) => item.pane_id === pane)?.rect;
+  if (!rect || !Number.isFinite(rect.width) || !Number.isFinite(rect.height) || rect.width <= 0 || rect.height <= 0) return "right";
+  return rect.width >= 2.5 * rect.height ? "right" : "down";
+}
+
+export async function closePaneAsync(pane: PaneId): Promise<void> {
+  assertTerminalAvailable();
+  await closeHerdrSurfaceAsync(pane);
+}
+
+export async function setPaneTaskAsync(pane: PaneId, task: string): Promise<void> {
+  if (isTerminalAvailable()) await reportHerdrPaneMetadataAsync(pane, task);
+}
+
+function envMilliseconds(value: string | undefined, fallback: number): number {
+  if (value == null || !value.trim()) return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
+export function getShellReadyDelayMs(): number {
+  return envMilliseconds(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS, 500);
+}
+
+/** Foreground-process observations are a readiness heuristic, not a prompt protocol. */
+export async function waitForShellReady(pane: PaneId, options: { timeoutMs?: number; settleMs?: number } = {}, deps = {
+  inspect: getPaneProcessInfo,
+  now: Date.now,
+  delay: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+  env: process.env as Record<string, string | undefined>,
+}): Promise<void> {
+  const started = deps.now();
+  const timeout = options.timeoutMs ?? envMilliseconds(deps.env.PI_SUBAGENT_SHELL_READY_TIMEOUT_MS, 5000);
+  const floor = envMilliseconds(deps.env.PI_SUBAGENT_SHELL_READY_DELAY_MS, 0);
+  const fallback = envMilliseconds(deps.env.PI_SUBAGENT_SHELL_READY_DELAY_MS, 500);
+  const settle = options.settleMs ?? 100;
+  let idleSamples = 0;
+  while (deps.now() - started < timeout) {
+    let info;
+    try { info = await deps.inspect(pane, Math.max(1, Math.min(1000, timeout - (deps.now() - started)))); }
+    catch {
+      // Older servers lack process-info. Preserve the historical minimum delay.
+      await deps.delay(Math.max(0, fallback - (deps.now() - started)));
+      return;
+    }
+    idleSamples = isShellIdle(info) ? idleSamples + 1 : 0;
+    if (idleSamples >= 2) {
+      await deps.delay(Math.max(settle, floor - (deps.now() - started)));
+      return;
+    }
+    await deps.delay(Math.min(50, Math.max(0, timeout - (deps.now() - started))));
+  }
+  throw new Error(`Shell in ${pane} did not become ready within ${timeout}ms; command not submitted`);
 }
 
 export function isTerminalAvailable(): boolean {
@@ -101,8 +178,7 @@ export function interruptPane(paneId: PaneId): void {
   sendHerdrEscape(paneId);
 }
 
-export function runScriptInPane(
-  paneId: PaneId,
+function writePaneScript(
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
@@ -120,8 +196,20 @@ export function runScriptInPane(
   scriptLines.push(command);
   writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
 
-  runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
   return scriptPath;
+}
+
+export function runScriptInPane(paneId: PaneId, command: string, options?: { scriptPath?: string; scriptPreamble?: string }): string {
+  const path = writePaneScript(command, options);
+  runInPane(paneId, `bash ${shellQuote(path)}`);
+  return path;
+}
+
+export async function runScriptInPaneAsync(paneId: PaneId, command: string, options?: { scriptPath?: string; scriptPreamble?: string }): Promise<string> {
+  assertTerminalAvailable();
+  const path = writePaneScript(command, options);
+  await sendHerdrCommandAsync(paneId, `bash ${shellQuote(path)}`);
+  return path;
 }
 
 export function readPane(paneId: PaneId, lines = 50): string {

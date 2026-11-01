@@ -17,16 +17,19 @@ import { homedir } from "node:os";
 import {
   isTerminalAvailable,
   terminalSetupHint,
-  createSubagentSurface,
+  createSubagentSurfaceAsync,
   resolveSubagentLayout,
-  runScriptInPane,
+  runScriptInPaneAsync,
   closePane,
+  closePaneAsync,
   interruptPane,
   shellQuote,
   readPane,
   readPaneAsync,
   inspectPane,
-  setPaneTask,
+  setPaneTaskAsync,
+  waitForShellReady,
+  getShellReadyDelayMs,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
@@ -472,19 +475,6 @@ function formatElapsed(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}m ${s}s`;
-}
-
-/**
- * Wait long enough for a freshly created pane to finish shell startup.
- *
- * Some environments do extra shell-init work before the prompt is ready
- * (for example direnv/devenv), so the delay is configurable for users who hit
- * dropped commands. Keep the historical default at 500ms.
- */
-function getShellReadyDelayMs(): number {
-  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
 function muxUnavailableResult() {
@@ -1168,12 +1158,15 @@ async function launchSubagent(
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout(), targetCwdForSession);
+  const surface = options?.surface ?? await createSubagentSurfaceAsync(params.name, resolveSubagentLayout(), targetCwdForSession);
   if (params.task) {
-    setPaneTask(surface, params.task);
+    await setPaneTaskAsync(surface, params.task);
   }
   if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    await waitForShellReady(surface).catch(async (error) => {
+      await closePaneAsync(surface).catch(() => {});
+      throw error;
+    });
   }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
@@ -1240,7 +1233,7 @@ async function launchSubagent(
   const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-  runScriptInPane(surface, built.command, {
+  await runScriptInPaneAsync(surface, built.command, {
     scriptPath: launchScriptFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
       `# Subagent launch script for ${params.name}`,
@@ -1317,7 +1310,7 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        closePane(surface);
+        await closePaneAsync(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1379,7 +1372,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
+    await closePaneAsync(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1396,7 +1389,7 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closePane(surface);
+      await closePaneAsync(surface);
     } catch {}
     running.lifecycle = markFailed(
       running.lifecycle,
@@ -1900,11 +1893,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSubagentSurface(name, resolveSubagentLayout(), ctx.cwd);
+        const surface = await createSubagentSurfaceAsync(name, resolveSubagentLayout(), ctx.cwd);
         if (params.message) {
-          setPaneTask(surface, params.message);
+          await setPaneTaskAsync(surface, params.message);
         }
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        await waitForShellReady(surface).catch(async (error) => {
+          await closePaneAsync(surface).catch(() => {});
+          throw error;
+        });
 
         // Build pi resume command
         const parts = ["pi", "--session", shellQuote(params.sessionPath)];
@@ -1944,7 +1940,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           "subagent-scripts",
           `${slugifyName(name, "resume")}-resume-${Date.now()}.sh`,
         );
-        runScriptInPane(surface, command, {
+        await runScriptInPaneAsync(surface, command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,

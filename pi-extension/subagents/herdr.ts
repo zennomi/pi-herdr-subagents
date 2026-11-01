@@ -71,8 +71,8 @@ function herdrExec(args: string[]): string {
   return execFileSync("herdr", args, { encoding: "utf8" });
 }
 
-async function herdrExecAsync(args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8" });
+async function herdrExecAsync(args: string[], timeout = 5000): Promise<string> {
+  const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8", timeout });
   return stdout;
 }
 
@@ -316,6 +316,75 @@ export function reportHerdrPaneTask(
   } catch {
     // Non-fatal: cosmetic metadata report failure should not abort subagent launch.
   }
+}
+
+export async function renameHerdrPaneAsync(pane: string, name: string): Promise<void> {
+  try { await herdrExecAsync(["pane", "rename", pane, name]); } catch { /* Cosmetic. */ }
+}
+
+export async function createHerdrSurfaceAsync(name: string, cwd = process.cwd()): Promise<string> {
+  let workspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!workspaceId) {
+    const parsed = parseHerdrJson(await herdrExecAsync(["pane", "current", "--current"])) as any;
+    workspaceId = parsed?.result?.pane?.workspace_id;
+    if (!workspaceId) throw new Error("Unable to resolve caller workspace");
+  }
+  const pane = extractHerdrRootPaneId(await herdrExecAsync(buildTabCreateArgs(name, cwd, workspaceId)), "tab create");
+  await renameHerdrPaneAsync(pane, name);
+  return pane;
+}
+
+export async function createHerdrSurfaceSplitAsync(name: string, direction: "right" | "down", cwd = process.cwd()): Promise<string> {
+  const pane = extractHerdrPaneId(await herdrExecAsync(buildPaneSplitArgs(getHerdrParentPaneId(), direction, cwd)), "pane split");
+  await renameHerdrPaneAsync(pane, name);
+  return pane;
+}
+
+export async function sendHerdrCommandAsync(pane: string, command: string): Promise<void> {
+  // Never retry a submission: a lost response does not prove non-delivery.
+  await herdrExecAsync(["pane", "run", pane, command]);
+}
+
+export async function closeHerdrSurfaceAsync(pane: string): Promise<void> {
+  try { await herdrExecAsync(["pane", "close", pane]); }
+  catch (error) { if (!isPaneMissingError(error)) throw error; }
+}
+
+export async function reportHerdrPaneMetadataAsync(pane: string, task: string): Promise<void> {
+  if (!task.trim()) return;
+  try { await herdrExecAsync(buildPaneReportTaskArgs(pane, task)); } catch { /* Cosmetic. */ }
+}
+
+export interface PaneLayout {
+  panes: Array<{ pane_id: string; rect: { width: number; height: number } }>;
+}
+
+export async function getPaneLayout(pane: string): Promise<PaneLayout> {
+  const parsed = parseHerdrJson(await herdrExecAsync(["pane", "layout", "--pane", pane])) as any;
+  const layout = parsed?.result?.layout;
+  if (!Array.isArray(layout?.panes)) throw new Error("Unsupported pane layout response");
+  return layout;
+}
+
+export interface PaneProcessInfo {
+  shell_pid: number;
+  foreground_process_group_id: number;
+  foreground_processes: Array<{ pid: number }>;
+}
+
+export function isShellIdle(info: PaneProcessInfo): boolean {
+  return Number.isInteger(info.shell_pid) && info.shell_pid > 0
+    && info.foreground_process_group_id === info.shell_pid
+    && Array.isArray(info.foreground_processes) && info.foreground_processes.length > 0
+    && info.foreground_processes.every((process) => process.pid === info.shell_pid);
+}
+
+export async function getPaneProcessInfo(pane: string, timeout = 1000): Promise<PaneProcessInfo> {
+  const parsed = parseHerdrJson(await herdrExecAsync(["pane", "process-info", "--pane", pane], timeout)) as any;
+  const info = parsed?.result?.process_info;
+  if (!info || typeof info.shell_pid !== "number" || typeof info.foreground_process_group_id !== "number"
+    || !Array.isArray(info.foreground_processes)) throw new Error("Unsupported pane process-info response");
+  return info;
 }
 
 export const __herdrTest__ = {
