@@ -2,6 +2,10 @@
 
 Async subagents for [pi](https://github.com/earendil-works/pi) in [herdr-tui](https://herdr.dev) and herdr-core. Subagents run in dedicated TUI tabs or panes, or independent core terminals. The parent keeps working while results arrive asynchronously.
 
+## This fork
+
+This is [zennomi/pi-herdr-subagents](https://github.com/zennomi/pi-herdr-subagents), maintained against [0xRichardH/pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents). See [SYNC.md](SYNC.md) for remote setup, safe upstream merges, verification, and publishing changes to this fork. The inherited npm release workflow runs only in the upstream repository.
+
 ## How It Works
 
 Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all tracked agents with their projected state — for example `starting`, `active`, `waiting`, `interrupted`, `stalled`, `running`, or `finalizing`. The header summarizes **active** (processing) vs **open** (not processing). When every tracked subagent is open, the border switches to amber. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
@@ -74,7 +78,7 @@ pi install npm:pi-herdr-subagents
 
 This project does not install or load `HazAT/pi-interactive-subagents` automatically.
 
-Changing the `package.json` version on `main` automatically creates a matching Git tag and GitHub Release, generates release notes, and publishes the package to npm. For authentication, versioning, verification, and troubleshooting, see [RELEASING.md](RELEASING.md).
+In the upstream repository only, changing the `package.json` version on `main` automatically creates a matching Git tag and GitHub Release, generates release notes, and publishes the package to npm. This fork does not run that release workflow. For authentication, versioning, verification, and troubleshooting, see [RELEASING.md](RELEASING.md).
 
 Start herdr, then run pi inside it:
 
