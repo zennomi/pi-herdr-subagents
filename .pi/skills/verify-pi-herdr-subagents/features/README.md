@@ -26,7 +26,7 @@ export SCRATCH=$(node -e 'console.log(require(process.argv[1]).scratchDir)' "$EV
 
 ## Proof and failure reporting
 
-Record feature ID and entry point, submitted action, visible result, tool result, and persisted side effect. CLI checks include command, output, and exit status. A provider failure, missing seed/precondition, refused tool call, or unavailable harness is a **failed or blocked journey**, not a pass through another path. Report untested entries separately. Interactive children must be observed directly because parent completion notifications are intentionally suppressed.
+Record feature ID and entry point, submitted action, visible result, tool result, and persisted side effect. CLI checks include command, output, and exit status. A provider failure, missing seed/precondition, refused tool call, or unavailable harness is a **failed or blocked journey**, not a pass through another path. Report untested entries separately. Observe interactive children directly while they remain open: stall/recovery steers are suppressed, but explicit completion still delivers a result.
 
 ## Features
 

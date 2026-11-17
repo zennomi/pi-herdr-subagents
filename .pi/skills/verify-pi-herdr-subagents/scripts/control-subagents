@@ -58,7 +58,7 @@ function doctor(s) {
   const pane = json('pane', 'get', s.rootPaneId).pane;
   if (pane.workspace_id !== s.workspaceId) throw new Error('Pane/workspace ownership mismatch');
   const processes = json('pane', 'process-info', '--pane', s.rootPaneId).process_info.foreground_processes;
-  if (!processes.some(p => p.name === 'pi' || p.argv?.some(a => /(?:^|\/)pi(?:\/dist\/cli\.js)?$/.test(a)))) throw new Error('Owned pane is not running Pi in the foreground');
+  if (!processes.some(p => p.name === 'pi' || p.argv0 === 'pi' || p.argv0?.endsWith('/pi') || p.argv?.some(a => /(?:^|\/)pi(?:\/dist\/cli\.js)?$/.test(a)))) throw new Error('Owned pane is not running Pi in the foreground');
   const ready = assistantSaid(s.readyToken);
   if (!ready) throw new Error('Pi has not completed its authenticated readiness prompt; inspect launch transcript');
   const result = { ready, pane: pane.pane_id, workspace: s.workspaceId, extension, sourceHash: s.sourceHash, model: s.model, piVersion: run('pi', ['--version']).trim(), herdrVersion: run('herdr', ['--version']).trim() };

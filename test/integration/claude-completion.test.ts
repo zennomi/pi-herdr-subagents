@@ -95,10 +95,12 @@ setInterval(() => {}, 60000); // Simulate the Claude TUI remaining open after St
       const child = [...__test__.runningSubagents.values()][0];
       assert.ok(child, "the async launch must initially be registered");
       const result = await delivered;
-      assert.equal(result.message.details.exitCode, 0);
+      assert.equal(result.message.details.exitCode, 0, JSON.stringify(result.message));
       assert.match(result.message.content, /RESUMED_COMPLETION_OK/);
       assert.deepEqual(result.options, { triggerTurn: true, deliverAs: "steer" });
       assert.equal(messages.filter((entry) => entry.message.customType === "subagent_result").length, 1);
+      // The send callback resolves before async delivery finalization resumes.
+      await child.watcher;
       assert.equal(__test__.runningSubagents.size, 0);
       assert.throws(() => execFileSync("herdr", ["pane", "get", child.surface], { encoding: "utf8", stdio: "pipe" }), /Command failed/);
     } finally {

@@ -1,3 +1,4 @@
+import { slugifyName } from "../../names.ts";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type {
@@ -42,6 +43,34 @@ export function buildPiPromptArgs(params: {
     ...(needsSeparator ? [""] : []),
     ...skillPrompts,
     params.taskArg,
+  ];
+}
+
+export function buildPiSubagentEnv(options: {
+  name: string;
+  agent?: string;
+  sessionFile: string;
+  id: string;
+  activityFile: string;
+  surface: string;
+  autoExit: boolean;
+  agentDir?: string;
+  denyTools?: ReadonlySet<string>;
+  quote: (value: string) => string;
+}): string[] {
+  const env: Record<string, string> = {
+    ...(options.agentDir ? { PI_CODING_AGENT_DIR: options.agentDir } : {}),
+    ...(options.denyTools?.size ? { PI_DENY_TOOLS: [...options.denyTools].join(",") } : {}),
+    PI_SUBAGENT_NAME: options.name,
+    ...(options.agent ? { PI_SUBAGENT_AGENT: options.agent } : {}),
+    PI_SUBAGENT_SESSION: options.sessionFile,
+    PI_SUBAGENT_ID: options.id,
+    PI_SUBAGENT_ACTIVITY_FILE: options.activityFile,
+    PI_SUBAGENT_SURFACE: options.surface,
+  };
+  return [
+    ...Object.entries(env).map(([key, value]) => `${key}=${options.quote(value)}`),
+    ...(options.autoExit ? ["PI_SUBAGENT_AUTO_EXIT=1"] : []),
   ];
 }
 
@@ -96,12 +125,7 @@ export class PiHarnessDriver implements HarnessDriver {
     if (identityInSystemPrompt && identity) {
       const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
       const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const spSafeName = params.name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "");
+      const spSafeName = slugifyName(params.name);
       const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
       mkdirSync(dirname(syspromptPath), { recursive: true });
       writeFileSync(syspromptPath, identity, "utf8");
@@ -114,28 +138,13 @@ export class PiHarnessDriver implements HarnessDriver {
       parts.push("--tools", shellQuote(toolAllowlist));
     }
 
-    const envParts: string[] = [];
-    if (localAgentDir && existsSync(localAgentDir)) {
-      envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(localAgentDir)}`);
-    } else if (process.env.PI_CODING_AGENT_DIR) {
-      envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
-    }
-
-    if (denySet && denySet.size > 0) {
-      envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
-    }
-    envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
-    if (params.agent) {
-      envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
-    }
-    if (effectiveAutoExit) {
-      envParts.push("PI_SUBAGENT_AUTO_EXIT=1");
-    }
-    envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
-    envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
     const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
-    envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-    envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
+    const envParts = buildPiSubagentEnv({
+      name: params.name, agent: params.agent, sessionFile: subagentSessionFile,
+      id: params.id, activityFile, surface, autoExit: effectiveAutoExit,
+      agentDir: localAgentDir && existsSync(localAgentDir) ? localAgentDir : process.env.PI_CODING_AGENT_DIR,
+      denyTools: denySet, quote: shellQuote,
+    });
 
     const fullTask = taskDelivery === "direct"
       ? params.task
@@ -146,12 +155,7 @@ export class PiHarnessDriver implements HarnessDriver {
       taskArg = fullTask;
     } else {
       const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const safeName = params.name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "");
+      const safeName = slugifyName(params.name);
       const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
       const artifactPath = join(artifactDir, artifactName);
       mkdirSync(dirname(artifactPath), { recursive: true });

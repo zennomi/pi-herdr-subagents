@@ -8,10 +8,17 @@ export type HerdrAgentStatus =
   | "done"
   | "unknown";
 
+export interface HerdrAgentSession {
+  kind: "path" | "id";
+  value: string;
+  agent?: string;
+}
+
 export type PaneInspection =
   | {
       kind: "present";
       agent?: string;
+      agentSession?: HerdrAgentSession;
       agentStatus: HerdrAgentStatus;
       observedAt: number;
     }

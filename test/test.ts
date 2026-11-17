@@ -1,15 +1,16 @@
 import { describe, it, before, after } from "node:test";
+import "./launch-reload.test.ts";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { Value } from "@sinclair/typebox/value";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { captureGuidanceRequests } from "./guidance-session.ts";
 import {
   cleanupSubagentsForShutdown,
-  selectCompletionApi,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
 } from "../pi-extension/subagents/index.ts";
@@ -158,6 +159,11 @@ function restoreEnvVar(name: string, value: string | undefined) {
     return;
   }
   process.env[name] = value;
+}
+
+async function withTempDirAsync(fn: (dir: string) => Promise<void>): Promise<void> {
+  const dir = createTestDir();
+  try { await fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 function withMockedNow<T>(now: number, fn: () => T): T {
@@ -1508,6 +1514,19 @@ describe("subagent-done.ts", () => {
     });
   });
 
+  it("uses Alt+J and a command without stealing Ctrl+J", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    const shortcuts: Array<{ key: string; handler: Function }> = [];
+    api.registerShortcut = (key: string, def: any) => shortcuts.push({ key, ...def });
+    subagentDoneExtension(api);
+    assert.deepEqual(shortcuts.map((s) => s.key), ["alt+j"]);
+    let updates = 0;
+    const ctx = { mode: "tui", hasUI: true, ui: { setWidget: () => updates++ } };
+    shortcuts[0].handler(ctx);
+    await registeredCommands.find((c) => c.name === "subagent-tools").handler("", ctx);
+    assert.equal(updates, 2);
+  });
+
   describe("auto-exit lifecycle", () => {
     it("waits for agent_settled and uses the latest agent result", () => {
       withTempDir((dir) => {
@@ -2036,7 +2055,7 @@ describe("commands", () => {
     const iterate = registeredCommands.find((command) => command.name === "iterate");
     assert.ok(iterate, "expected /iterate to be registered");
 
-    iterate.handler("Fix the bug", {});
+    iterate.handler("Fix the bug", { isIdle: () => true });
 
     assert.equal(sentUserMessages.length, 1);
     assert.match(sentUserMessages[0], /fork: true/);
@@ -2046,6 +2065,57 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("declares tool side-effect annotations", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const annotations = (name: string) => registeredTools.find((t) => t.name === name).annotations;
+    assert.deepEqual(annotations("subagents_list"), { readOnlyHint: true, openWorldHint: false });
+    assert.equal(annotations("subagent").openWorldHint, true);
+    assert.equal(annotations("subagent_resume").readOnlyHint, false);
+    assert.equal(annotations("subagent_interrupt").idempotentHint, false);
+  });
+  it("provides schema-valid data and explicit errors for programmatic callers", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const list = registeredTools.find((t) => t.name === "subagents_list");
+    const listed = await list.execute();
+    assert.ok(Value.Check(list.outputSchema, listed.structuredContent));
+    assert.ok(listed.structuredContent.agents.length > 0);
+    const interrupt = registeredTools.find((t) => t.name === "subagent_interrupt");
+    const missing = await interrupt.execute("test", { id: "not-running" });
+    assert.equal(missing.isError, true);
+    assert.equal(missing.structuredContent.status, "error");
+    assert.ok(Value.Check(interrupt.outputSchema, missing.structuredContent));
+    const running: any = { id: "abc", name: "test", sessionFile: "/a.jsonl", surface: "w1:p2" };
+    for (const name of ["subagent", "subagent_resume"]) {
+      const tool = registeredTools.find((t) => t.name === name);
+      assert.ok(Value.Check(tool.outputSchema, subagentsModule.__test__.startedContent(running)));
+    }
+  });
+  it("queues command messages only when the session is busy", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    const calls: any[] = [];
+    api.sendUserMessage = (message: string, options: any) => calls.push({ message, options });
+    subagentsModule.default(api);
+    for (const name of ["iterate", "subagent"]) {
+      const command = registeredCommands.find((c) => c.name === name);
+      for (const idle of [true, false]) {
+        await command.handler(name === "subagent" ? "scout inspect" : "inspect", { isIdle: () => idle });
+        assert.deepEqual(calls.at(-1).options, idle ? undefined : { deliverAs: "followUp" });
+      }
+    }
+    assert.equal(calls.length, 4);
+  });
+  it("keeps tool prompt snippets short and distinct from descriptions", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+    assert.equal(registeredTools.length, 4);
+    for (const tool of registeredTools) {
+      assert.notEqual(tool.promptSnippet, tool.description);
+      assert.ok(tool.promptSnippet.length < 120);
+      assert.ok(!tool.promptSnippet.includes("\n"));
+    }
+  });
   it("advertises named agents and tells callers to preserve their runtime defaults", async () => {
     const [{ prompt }] = await captureGuidanceRequests();
     assert.match(prompt, /Available named subagents/);
@@ -2109,6 +2179,27 @@ describe("tool registration", () => {
     });
   });
 
+  it("resolves relative agent frontmatter cwd against the project root", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const root = "/tmp/example-project";
+
+    const fromAgent = testApi.resolveSubagentPaths({}, { cwd: "./vat-ly-ai-frontend" }, root);
+    assert.equal(fromAgent.effectiveCwd, "/tmp/example-project/vat-ly-ai-frontend");
+
+    const fromParam = testApi.resolveSubagentPaths(
+      { cwd: "agents/sre" },
+      { cwd: "./ignored" },
+      root,
+    );
+    assert.equal(fromParam.effectiveCwd, "/tmp/example-project/agents/sre");
+
+    const absolute = testApi.resolveSubagentPaths({}, { cwd: "/opt/backend" }, root);
+    assert.equal(absolute.effectiveCwd, "/opt/backend");
+
+    const none = testApi.resolveSubagentPaths({}, null, root);
+    assert.equal(none.effectiveCwd, null);
+  });
+
   it("expands spawning false to deny subagent interruption", () => {
     const testApi = (subagentsModule as any).__test__;
     const denied = testApi.resolveDenyTools({ spawning: false });
@@ -2153,6 +2244,56 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("cross-checks Pi session paths without following foreign paths or warning for other CLIs", () => {
+    const running: any = { sessionFile: "/expected.jsonl" };
+    const inspection: any = { kind: "present", agent: "pi", agentSession: { kind: "path", value: "/observed.jsonl" } };
+    subagentsModule.__test__.observeHerdrSession(running, inspection);
+    assert.equal(running.sessionFile, "/expected.jsonl");
+    assert.equal(running.observedSessionFile, "/observed.jsonl");
+    assert.match(running.sessionMismatch, /Herdr reported/);
+    inspection.agentSession.value = "/expected.jsonl";
+    subagentsModule.__test__.observeHerdrSession(running, inspection);
+    assert.equal(running.sessionMismatch, undefined);
+    inspection.agentSession.value = "/other.jsonl";
+    running.cli = "claude";
+    subagentsModule.__test__.observeHerdrSession(running, inspection);
+    assert.equal(running.sessionMismatch, undefined);
+  });
+  it("assigns a Herdr agent name once, with a bounded collision retry", async () => {
+    const running: any = { id: "abcdef12", name: "Review", surface: "w1:p2", lifecycle: createLifecycle(0) };
+    const calls: string[] = [];
+    const rename = async (_pane: string, name: string) => { calls.push(name); if (name === "review") throw Error("collision"); };
+    await subagentsModule.__test__.assignHerdrAgentName(running, rename);
+    await subagentsModule.__test__.assignHerdrAgentName(running, rename);
+    assert.deepEqual(calls, ["review", "review-abcd"]);
+    assert.equal(running.herdrAgentName, "review-abcd");
+  });
+  it("shares exactly-once delivery for spawn, resume and ping", async () => {
+    await withTempDirAsync(async (dir) => {
+      const { api, sentMessages } = createMockExtensionApi();
+      subagentsModule.default(api);
+      const helpers = subagentsModule.__test__;
+      helpers.runtime.readyApi = api;
+      const sessionFile = createSessionFile(dir, [
+        { type: "message", message: { role: "assistant", content: [{ type: "text", text: "old" }] } },
+        { type: "message", message: { role: "assistant", content: [{ type: "text", text: "new" }] } },
+      ]);
+      for (const kind of ["spawn", "resume", "ping"] as const) {
+        const running: any = { id: kind, name: kind, task: "task", sessionFile, lifecycle: createLifecycle(0) };
+        helpers.runningSubagents.set(kind, running);
+        const result = { name: kind, task: "task", summary: "spawn output", elapsed: 1, exitCode: 0, sessionFile,
+          ...(kind === "ping" ? { ping: { name: kind, message: "help" } } : {}) };
+        const options = { kind: kind === "resume" ? "resume" as const : "spawn" as const, entryCountBefore: 1 };
+        await helpers.deliverSubagentCompletion(running, result, options);
+        const count = sentMessages.length;
+        await helpers.deliverSubagentCompletion(running, result, options);
+        assert.equal(sentMessages.length, count);
+        assert.equal(helpers.runningSubagents.has(kind), false);
+        assert.match(sentMessages.at(-1).message.content, kind === "resume" ? /new/ : kind === "ping" ? /help/ : /spawn output/);
+      }
+      assert.equal(sentMessages.length, 3);
+    });
+  });
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
     const agents = new Map([["child", {
@@ -2204,13 +2345,6 @@ describe("subagent parent lifecycle", () => {
     assert.equal(shouldDeliverSubagentCompletion({} as any), true);
   });
 
-  it("delivers completion through the reloaded extension API", () => {
-    const previous = { id: "previous" };
-    const current = { id: "current" };
-
-    assert.equal(selectCompletionApi(previous, current), current);
-    assert.equal(selectCompletionApi(previous, undefined), previous);
-  });
 });
 
 describe("subagent activity snapshots", () => {
@@ -2385,7 +2519,7 @@ describe("subagent activity snapshots", () => {
   });
 });
 
-describe("subagent interruption", () => {
+describe("subagent interruption", async () => {
   function makeRunning(overrides: Record<string, unknown> = {}) {
     return {
       id: "a1",
@@ -2400,7 +2534,7 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_interrupt in the main session extension", () => {
+  it("registers subagent_interrupt in the main session extension", async () => {
     const { api, registeredTools } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
@@ -2408,7 +2542,7 @@ describe("subagent interruption", () => {
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
   });
 
-  it("resolves interrupt targets by exact id and reports name ambiguity", () => {
+  it("resolves interrupt targets by exact id and reports name ambiguity", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2428,7 +2562,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("returns an explicit error when Escape delivery fails", () => {
+  it("returns an explicit error when Escape delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     let aborted = false;
     const running = makeRunning({
@@ -2439,7 +2573,7 @@ describe("subagent interruption", () => {
       },
     });
 
-    const result = testApi.requestSubagentInterrupt(running, () => {
+    const result = await testApi.requestSubagentInterrupt(running, async () => {
       throw new Error("mux write failed");
     });
 
@@ -2448,7 +2582,7 @@ describe("subagent interruption", () => {
     assert.equal("interruptRequested" in running, false);
   });
 
-  it("leaves status unchanged when Escape delivery fails in the tool path", () => {
+  it("leaves status unchanged when Escape delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2480,7 +2614,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-      const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+      const result = await withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, async () => {
         throw new Error("mux write failed");
       }));
 
@@ -2491,7 +2625,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("sends Escape without aborting or mutating running state", () => {
+  it("sends Escape without aborting or mutating running state", async () => {
     const testApi = (subagentsModule as any).__test__;
     let aborted = false;
     let sentSurface = "";
@@ -2503,7 +2637,7 @@ describe("subagent interruption", () => {
       },
     });
 
-    const result = testApi.requestSubagentInterrupt(running, (surface: string) => {
+    const result = await testApi.requestSubagentInterrupt(running, (surface: string) => {
       sentSurface = surface;
     });
 
@@ -2513,13 +2647,13 @@ describe("subagent interruption", () => {
     assert.equal("interruptRequested" in running, false);
   });
 
-  it("refreshes the latest activity snapshot before forcing local interrupt waiting", () => {
+  it("refreshes the latest activity snapshot before forcing local interrupt waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
     runningMap.clear();
 
-    withTempDir((dir) => {
+    await withTempDirAsync(async (dir) => {
       mkdirSync(join(dir, "subagent-activity"), { recursive: true });
       const activityFile = getSubagentActivityFile(dir, "a1");
       const activity = {
@@ -2543,7 +2677,7 @@ describe("subagent interruption", () => {
       try {
         runningMap.set("a1", makeRunning({ activityFile }));
 
-        withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+        await withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
           sentSurface = surface;
         }));
 
@@ -2560,7 +2694,7 @@ describe("subagent interruption", () => {
     });
   });
 
-  it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
+  it("acknowledges Pi-backed interrupt requests and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2593,7 +2727,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-      const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      const result = await withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
         sentSurface = surface;
       }));
 
@@ -2608,7 +2742,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("sends Escape again for repeated interrupt requests", () => {
+  it("sends Escape again for repeated interrupt requests", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     const surfaces: string[] = [];
@@ -2617,10 +2751,10 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning());
 
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      await testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
         surfaces.push(surface);
       });
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      await testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
         surfaces.push(surface);
       });
 
@@ -2631,7 +2765,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("rejects Claude-backed interrupt requests before delivery", () => {
+  it("rejects Claude-backed interrupt requests before delivery", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let delivered = false;
@@ -2640,7 +2774,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ cli: "claude" }));
 
-      const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+      const result = await testApi.handleSubagentInterrupt({ name: "Worker" }, async () => {
         delivered = true;
       });
 
@@ -2656,7 +2790,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("formats exit code 130 as an ordinary failure", () => {
+  it("formats exit code 130 as an ordinary failure", async () => {
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
       {
@@ -2673,7 +2807,7 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Resume: pi --session/);
   });
 
-  it("renders a clear provider/agent error when errorMessage is set", () => {
+  it("renders a clear provider/agent error when errorMessage is set", async () => {
     // Previously, an overload retry-exhaustion produced exitCode 0 with a
     // stale summary — the orchestrator thought the subagent finished
     // quickly. With the error sidecar plumbed through, the presentation
@@ -2809,6 +2943,35 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
+  it("registers once, requests renders, clears footer and ignores RPC UI", () => {
+    const helpers = subagentsModule.__test__;
+    const previous = helpers.runtime.latestCtx;
+    const widgets: any[] = [], statuses: any[] = [];
+    let renders = 0;
+    const ctx: any = { mode: "tui", hasUI: true, ui: {
+      setWidget: (_key: string, factory: any) => { widgets.push(factory); factory?.({ requestRender: () => renders++ }); },
+      setStatus: (_key: string, value: any) => statuses.push(value),
+    } };
+    try {
+      helpers.runtime.latestCtx = ctx;
+      helpers.runningSubagents.set("widget-test", { id: "widget-test", lifecycle: createLifecycle(0) } as any);
+      helpers.updateWidget(); helpers.updateWidget(); helpers.updateWidget();
+      assert.equal(widgets.length, 1);
+      assert.equal(renders, 3);
+      assert.deepEqual(statuses, ["⧗ 1 subagents"]);
+      helpers.runningSubagents.clear(); helpers.updateWidget();
+      assert.equal(widgets.at(-1), undefined);
+      assert.equal(statuses.at(-1), undefined);
+      const calls = widgets.length;
+      helpers.runtime.latestCtx = { ...ctx, mode: "rpc" };
+      helpers.runningSubagents.set("widget-test", { lifecycle: createLifecycle(0) } as any);
+      helpers.updateWidget();
+      assert.equal(widgets.length, calls);
+    } finally {
+      helpers.runningSubagents.clear(); helpers.updateWidget();
+      helpers.runtime.latestCtx = previous;
+    }
+  });
   it("projects Claude agents as running and counts them as active", () => {
     const testApi = (subagentsModule as any).__test__;
     const originalNow = Date.now;

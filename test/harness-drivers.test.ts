@@ -108,7 +108,24 @@ describe("Harness Drivers Registry", () => {
   });
 });
 
+import { buildPiSubagentEnv } from "../pi-extension/subagents/harness/drivers/pi.ts";
+import { shellQuote } from "../pi-extension/subagents/terminal.ts";
+
 describe("Pi Harness Driver", () => {
+  it("shares quoted spawn/resume identity and config isolation", () => {
+    const env = buildPiSubagentEnv({
+      name: "Worker's pane", sessionFile: "/sessions/a.jsonl", id: "abc12345",
+      activityFile: "/artifacts/activity.json", surface: "w1:p2", autoExit: true,
+      agentDir: "/isolated config", quote: shellQuote,
+    }).join(" ");
+    assert.ok(env.includes("PI_SUBAGENT_NAME=" + shellQuote("Worker's pane")));
+    assert.ok(env.includes("PI_SUBAGENT_SURFACE='w1:p2'"));
+    assert.ok(env.includes("PI_CODING_AGENT_DIR='/isolated config'"));
+    assert.ok(env.includes("PI_SUBAGENT_AUTO_EXIT=1"));
+    const built = new PiHarnessDriver().buildCommand(createMockLaunchContext());
+    assert.ok(built.command.includes("PI_SUBAGENT_SURFACE='pane-1'"));
+    assert.ok(built.command.includes("PI_SUBAGENT_ID='abc12345'"));
+  });
   const driver = new PiHarnessDriver();
 
   it("formats model using full provider/model reference", () => {
