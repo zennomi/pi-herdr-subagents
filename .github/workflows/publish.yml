@@ -19,6 +19,7 @@ concurrency:
 jobs:
   detect:
     name: Detect version bump
+    if: github.repository == '0xRichardH/pi-herdr-subagents'
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.version.outputs.release }}
