@@ -337,6 +337,52 @@ describe("watcher delivery across replacement runtimes", () => {
     });
   }
 
+  for (const gap of ["reload", "rejected delivery"]) {
+    for (const newOutput of [false, true]) {
+      it(`freezes kept-open resume summary across ${gap} with new output=${newOutput}`, async () => {
+        await withHarness(async (h) => {
+          const notifications: any[] = [];
+          const overrides = { notifyHerdrCompletion: async (...args: any[]) => { notifications.push(args); } };
+          const old = h.load(overrides);
+          await old.start();
+          const running = runningFrom(await old.launch("resume"));
+          if (gap === "reload") old.shutdown("reload");
+          else old.api.sendMessage = () => Promise.reject(new Error("send failed"));
+
+          const original = "ORIGINAL RESUMED TASK ANSWER";
+          if (newOutput) appendFileSync(running.sessionFile, assistantEntry(original));
+          h.completion.resolve({ reason: "done", exitCode: 0, keepOpen: true });
+          await running.watcher;
+          assert.equal(running.lifecycle.delivery, "pending");
+          assert.equal(notifications.length, 0);
+          if (gap === "rejected delivery") {
+            assert.match(running.deliveryError!, /send failed/);
+            old.shutdown("reload");
+          }
+
+          appendFileSync(running.sessionFile, assistantEntry("UNRELATED MANUAL FOLLOWUP ANSWER"));
+          const replacement = h.load(overrides);
+          const starting = replacement.start();
+          __test__.runtime.parentPane = "mock-parent";
+          await starting;
+          await replacement.start();
+
+          const expected = newOutput ? original : "Resumed session exited without new output";
+          assert.equal(replacement.messages.length, 1);
+          const content = replacement.messages[0].message.content;
+          assert.ok(content.includes(expected));
+          assert.doesNotMatch(content, /UNRELATED MANUAL FOLLOWUP ANSWER|old output/);
+          assert.match(content, /pane stayed open/);
+          assert.equal(notifications.length, 1);
+          assert.equal(notifications[0][3], expected);
+          assert.deepEqual(h.calls.closed, []);
+          assert.equal(running.lifecycle.delivery, "delivered");
+          assert.equal(__test__.runningSubagents.size, 0);
+        });
+      });
+    }
+  }
+
   for (const failure of ["throw", "reject"]) {
     it(`contains sendMessage ${failure}, keeps the original result and only retries on a replacement API`, async () => {
       await withHarness(async (h) => {

@@ -1684,7 +1684,7 @@ function flushSubagentCompletion(running: RunningSubagent, deps = defaultDepende
     try {
       if (!shouldDeliverSubagentCompletion(running) || runtime.readyApi !== api || runtime.pi !== api) return;
       running.lastDeliveryApi = api;
-      const summary = completionSummary(running, result, options);
+      const summary = result.summary;
       await api.sendMessage(completionMessage(running, result, options, summary), { triggerTurn: true, deliverAs: "steer" });
       if (!shouldDeliverSubagentCompletion(running)) return;
       running.lifecycle = markDelivery(running.lifecycle, "delivered");
@@ -1715,7 +1715,12 @@ async function deliverSubagentCompletion(
   deps = defaultDependencies,
 ): Promise<void> {
   if (!shouldDeliverSubagentCompletion(running)) return;
-  running.pendingCompletion ??= { result, options };
+  // Freeze resume-specific extraction before deferring delivery: a kept-open
+  // session may gain unrelated follow-up output during reload or send retries.
+  running.pendingCompletion ??= {
+    result: { ...result, summary: completionSummary(running, result, options) },
+    options,
+  };
   await flushSubagentCompletion(running, deps);
 }
 
