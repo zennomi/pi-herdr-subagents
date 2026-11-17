@@ -41,6 +41,7 @@ async function withHarness(run: (h: any) => Promise<void>) {
   };
   const deps: any = {
     isTerminalAvailable: () => true,
+    getTerminalBackendKind: () => "herdr-tui",
     createSubagentSurfaceAsync: async () => { calls.created.push("owned-pane"); return "owned-pane"; },
     setPaneTaskAsync: async () => {},
     waitForShellReady: async () => {},
@@ -200,6 +201,82 @@ describe("owned launch transactions (registered spawn and resume tools)", () => 
         assert.equal(__test__.runtime.paneCleanups!.size, 0);
         assert.deepEqual(h.calls.closed, ["owned-pane", "owned-pane"]);
         assert.deepEqual(h.calls.submitted, ["owned-pane"]);
+      });
+    });
+  }
+});
+
+describe("dual-backend launch and keep-open merge regressions", () => {
+  for (const kind of ["spawn", "resume"]) {
+    for (const keepOpen of [false, true]) {
+      it(`core ${kind}: launches directly once and preserves keepOpen=${keepOpen} across reload`, async () => {
+        await withHarness(async (h) => {
+          const requests: any[] = [];
+          const old = h.load({
+            getTerminalBackendKind: () => "herdr-core",
+            launchSubagentTerminal: async (request: any) => { requests.push(request); return "core-child"; },
+            createSubagentSurfaceAsync: () => { throw new Error("core must not create a TUI pane"); },
+            waitForShellReady: () => { throw new Error("core must not wait for a TUI shell"); },
+          });
+          await old.start();
+          const result = await old.launch(kind);
+          const running = runningFrom(result);
+          assert.equal(result.structuredContent.surface, "core-child");
+          assert.equal(requests.length, 1);
+          assert.equal(requests[0].cwd, h.ctx.cwd);
+          assert.ok(!requests[0].command.includes("PI_SUBAGENT_SURFACE="));
+          assert.ok(requests[0].command.includes("PI_SUBAGENT_ID="));
+          assert.deepEqual(h.calls.submitted, []);
+          old.shutdown("reload");
+          appendFileSync(running.sessionFile, assistantEntry("core result"));
+          h.completion.resolve({ reason: "done", exitCode: 0, keepOpen });
+          await running.watcher;
+          const replacement = h.load();
+          await replacement.start();
+          assert.equal(replacement.messages.length, 1);
+          assert.match(replacement.messages[0].message.content, /core result/);
+          assert.equal(replacement.messages[0].message.content.includes("pane stayed open"), keepOpen);
+          assert.deepEqual(h.calls.closed, keepOpen ? [] : ["core-child"]);
+          assert.equal(__test__.runningSubagents.size, 0);
+        });
+      });
+    }
+
+    it(`core ${kind}: closes a returned terminal when reload overtakes launch`, async () => {
+      await withHarness(async (h) => {
+        const entered = deferred();
+        const release = deferred();
+        let launches = 0;
+        const old = h.load({
+          getTerminalBackendKind: () => "herdr-core",
+          launchSubagentTerminal: async () => { launches++; entered.resolve(); await release.promise; return "core-child"; },
+        });
+        await old.start();
+        const launching = assert.rejects(old.launch(kind), /parent session changed or reloaded/);
+        await entered.promise;
+        old.shutdown("reload");
+        await h.load().start();
+        release.resolve();
+        await launching;
+        assert.equal(launches, 1);
+        assert.deepEqual(h.calls.closed, ["core-child"]);
+        assert.equal(h.calls.watched, 0);
+      });
+    });
+
+    it(`TUI ${kind}: keep-open bypasses final cleanup but still delivers once`, async () => {
+      await withHarness(async (h) => {
+        const api = h.load();
+        await api.start();
+        const running = runningFrom(await api.launch(kind));
+        appendFileSync(running.sessionFile, assistantEntry("kept open"));
+        h.completion.resolve({ reason: "done", exitCode: 0, keepOpen: true });
+        await running.watcher;
+        await api.start();
+        assert.equal(api.messages.length, 1);
+        assert.match(api.messages[0].message.content, /pane stayed open/);
+        assert.deepEqual(h.calls.closed, []);
+        assert.equal(__test__.runningSubagents.size, 0);
       });
     });
   }

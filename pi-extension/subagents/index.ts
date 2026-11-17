@@ -21,6 +21,8 @@ import {
   createSubagentSurfaceAsync,
   resolveSubagentLayout,
   runScriptInPaneAsync,
+  launchSubagentTerminal,
+  getTerminalBackend,
   closePane,
   closePaneAsync,
   interruptPaneAsync,
@@ -46,7 +48,8 @@ import {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
-import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import { resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import { getSubagentConfig } from "./config.ts";
 
 import {
   findLastAssistantMessage,
@@ -60,7 +63,6 @@ import {
   formatElapsedDuration,
   formatStatusAggregate,
   normalizeStatusName,
-  loadStatusConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -377,7 +379,7 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function buildAvailableAgentCatalog(
   agents: ListedAgentDefinition[],
   limit = 24,
-  config: ModelConfig = modelConfig,
+  modelConfig: ModelConfig = config.models,
 ): string {
   const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
   const visible = sorted.slice(0, limit);
@@ -386,7 +388,7 @@ function buildAvailableAgentCatalog(
   ];
 
   for (const agent of visible) {
-    const effectiveModel = resolveModelDefault(agent.name, agent.model, config);
+    const effectiveModel = resolveModelDefault(agent.name, agent.model, modelConfig);
     const defaults = [
       effectiveModel ? `model ${effectiveModel}` : undefined,
       agent.thinking ? `thinking ${agent.thinking}` : undefined,
@@ -512,7 +514,7 @@ function formatElapsed(seconds: number): string {
 }
 
 function muxUnavailableResult() {
-  return toolError(`Subagents require herdr. ${terminalSetupHint()}`, "herdr not available");
+  return toolError(`Subagents require herdr-tui or herdr-core. ${terminalSetupHint()}`, "herdr not available");
 }
 
 /**
@@ -525,16 +527,16 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const statusConfig = loadStatusConfig();
-const modelConfig = loadModelConfig();
+const config = getSubagentConfig();
 
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "keepOpen"
   >,
   name: string,
 ): string {
+  const followUp = result.keepOpen === true ? "\n\nThe pane stayed open for follow-up conversation." : "";
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
@@ -549,13 +551,13 @@ function resolveResultPresentation(
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_resume.${sessionRef}`
+      `subagent or resume the session with subagent_resume.${sessionRef}${followUp}`
     );
   }
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}${followUp}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}${followUp}`;
 }
 
 /**
@@ -572,6 +574,7 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  keepOpen?: boolean;
   ping?: { name: string; message: string };
 }
 
@@ -690,6 +693,8 @@ export function shouldDeliverSubagentCompletion(
 // Injectable I/O boundaries shared by the real spawn/resume/watcher paths.
 const defaultDependencies = {
   isTerminalAvailable,
+  getTerminalBackendKind: () => getTerminalBackend().kind,
+  launchSubagentTerminal,
   createSubagentSurfaceAsync,
   setPaneTaskAsync,
   waitForShellReady,
@@ -733,7 +738,7 @@ async function launchInOwnedPane(
   sessionId: string,
   deps: SubagentDependencies,
   options: DeliveryOptions,
-  buildAndSubmit: (surface: string, assertCurrent: () => void) => Promise<RunningSubagent>,
+  buildAndSubmit: (surface: string, assertCurrent: () => void, submitScript: typeof runScriptInPaneAsync) => Promise<RunningSubagent>,
 ): Promise<RunningSubagent> {
   const generation = runtime.launchGeneration;
   const assertCurrent = () => {
@@ -743,22 +748,41 @@ async function launchInOwnedPane(
     }
   };
   assertCurrent();
-  const surface = await deps.createSubagentSurfaceAsync(name, resolveSubagentLayout(), cwd);
+  const core = deps.getTerminalBackendKind() === "herdr-core";
+  let surface: string | undefined;
   try {
+    let submitScript = deps.runScriptInPaneAsync;
+    if (core) {
+      // Core runs the script directly, so its address is only known after launch.
+      // The script binds PI_SUBAGENT_SURFACE from the child's HC_TERMINAL_ID.
+      submitScript = async (_pane, command, scriptOptions) => {
+        assertCurrent();
+        if (!scriptOptions?.scriptPath) throw new Error("Core launch requires a script path");
+        surface = await deps.launchSubagentTerminal({
+          name, task, cwd, layout: resolveSubagentLayout(), command,
+          scriptPath: scriptOptions.scriptPath, preamble: scriptOptions.scriptPreamble,
+        });
+        return scriptOptions.scriptPath;
+      };
+    } else {
+      surface = await deps.createSubagentSurfaceAsync(name, resolveSubagentLayout(), cwd);
+      assertCurrent();
+      await deps.setPaneTaskAsync(surface, task, displayAgent);
+      assertCurrent();
+      await deps.waitForShellReady(surface);
+    }
     assertCurrent();
-    await deps.setPaneTaskAsync(surface, task, displayAgent);
+    const running = await buildAndSubmit(surface ?? "", assertCurrent, submitScript);
     assertCurrent();
-    await deps.waitForShellReady(surface);
-    assertCurrent();
-    const running = await buildAndSubmit(surface, assertCurrent);
-    assertCurrent();
+    if (!surface) throw new Error("Subagent launch returned no terminal");
+    running.surface = surface;
     runningSubagents.set(running.id, running);
     attachWatcher(running, deps, options);
     return running;
   } catch (error) {
     // A pane-run timeout is ambiguous: it may already have launched the child.
     // Never submit again. Close the owned surface, retaining cleanup on failure.
-    await closeOwnedPane(surface, deps);
+    if (surface) await closeOwnedPane(surface, deps);
     throw error;
   }
 }
@@ -891,7 +915,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const runtimeTag = agent.runtimePlan
       ? `${agent.runtimePlan.modelId}|${agent.runtimePlan.thinking} · `
       : "";
-    const right = statusConfig.enabled
+    const right = config.status.enabled
       ? ` ${runtimeTag}${formatLifecycleWidgetLabel(projection, now).trim()} `
       : agent.cli && agent.cli !== "pi"
         ? ` ${runtimeTag}running… `
@@ -1143,7 +1167,7 @@ async function handleSubagentInterrupt(
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+  if (!config.status.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1190,13 +1214,13 @@ function startStatusRefresh(pi: ExtensionAPI) {
     if (shouldRefreshWidget) updateWidget();
 
     if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+      const capped = capStatusLines(transitionLines, config.status.lineLimit);
       void Promise.resolve().then(() => {
         if (runtime.readyApi !== pi) return;
         return pi.sendMessage(
           {
             customType: "subagent_status",
-            content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+            content: formatStatusAggregate(transitionLines, config.status.lineLimit),
             display: true,
             details: { lines: capped.visibleLines, overflow: capped.overflow },
           },
@@ -1254,10 +1278,7 @@ function startWidgetRefresh() {
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
-/**
- * Launch a subagent: creates the herdr pane, builds the command, and
- * submits it once, and attaches supervision before returning.
- */
+/** Launch once and attach reload-safe supervision before returning. */
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: {
@@ -1282,7 +1303,7 @@ async function launchSubagent(
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
     {
-      model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
+      model: resolveModelDefault(params.agent, agentDefs?.model, config.models),
       thinking: agentDefs?.thinking,
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
@@ -1318,7 +1339,7 @@ async function launchSubagent(
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   return launchInOwnedPane(params.name, params.task, `${cliId} · ${params.agent ?? params.name}`,
-    targetCwdForSession, sessionId, deps, { kind: "spawn" }, async (surface, assertCurrent) => {
+    targetCwdForSession, sessionId, deps, { kind: "spawn" }, async (surface, assertCurrent, submitScript) => {
       const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
       if (launchBehavior.seededSessionMode) {
@@ -1384,7 +1405,7 @@ async function launchSubagent(
       const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
       assertCurrent();
-      await deps.runScriptInPaneAsync(surface, built.command, {
+      await submitScript(surface, built.command, {
         scriptPath: launchScriptFile,
         scriptPreamble: (built.launchScriptPreamble ?? [
           `# Subagent launch script for ${params.name}`,
@@ -1432,7 +1453,7 @@ async function assignHerdrAgentName(
   running: RunningSubagent,
   rename = renameHerdrAgent,
 ): Promise<void> {
-  if (process.env.PI_SUBAGENT_HERDR_AGENT_NAME === "0" || running.herdrAgentNameAttempted
+  if (getTerminalBackend().kind !== "herdr-tui" || process.env.PI_SUBAGENT_HERDR_AGENT_NAME === "0" || running.herdrAgentNameAttempted
     || !shouldDeliverSubagentCompletion(running)) return;
   running.herdrAgentNameAttempted = true;
   for (const candidate of [toHerdrAgentName(running.name), toHerdrAgentName(running.name, running.id)]) {
@@ -1451,6 +1472,7 @@ async function watchSubagent(
   deps: SubagentDependencies,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  let keepOpen = false;
 
   try {
     const result = await deps.waitForCompletion(signal, {
@@ -1471,6 +1493,7 @@ async function watchSubagent(
       },
     });
 
+    keepOpen = result.keepOpen === true;
     const detectedAt = Date.now();
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
@@ -1500,6 +1523,7 @@ async function watchSubagent(
           elapsed,
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
           ...extracted.details,
+          keepOpen: result.keepOpen,
         };
       }
     }
@@ -1560,6 +1584,7 @@ async function watchSubagent(
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
+      keepOpen: result.keepOpen,
       ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
@@ -1590,9 +1615,10 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      keepOpen,
     };
   } finally {
-    await closeOwnedPane(surface, deps);
+    if (!keepOpen) await closeOwnedPane(surface, deps);
   }
 }
 
@@ -1730,7 +1756,8 @@ export default function subagentsExtension(pi: ExtensionAPI, dependencies: Parti
     runtime.readyApi = pi;
     runtime.sessionId = ctx.sessionManager.getSessionId();
     runtime.latestCtx = ctx;
-    runtime.parentPane = ctx.mode === "tui" && isTerminalAvailable() ? process.env.HERDR_PANE_ID : undefined;
+    runtime.parentPane = ctx.mode === "tui" && isTerminalAvailable() && deps.getTerminalBackendKind() === "herdr-tui"
+      ? process.env.HERDR_PANE_ID : undefined;
     refreshParentMetadata(runningSubagents.size, true);
     runtime.modelCatalog = buildAuthenticatedModelCatalog(
       wrapPiModelRegistry(ctx.modelRegistry),
@@ -1795,13 +1822,13 @@ export default function subagentsExtension(pi: ExtensionAPI, dependencies: Parti
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal herdr pane. " +
+        "Spawn a sub-agent in a dedicated terminal. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
-      promptSnippet: "Spawn an async sub-agent in a herdr pane; its result arrives later as a steer message.",
+      promptSnippet: "Spawn an async sub-agent in a terminal; its result arrives later as a steer message.",
       promptGuidelines: subagentRoutingGuidelines,
       parameters: SubagentParams,
       outputSchema: StartedSchema,
@@ -1847,7 +1874,9 @@ export default function subagentsExtension(pi: ExtensionAPI, dependencies: Parti
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting. ` +
-                `Herdr target (once detected): herdr agent read ${running.herdrAgentName ?? running.surface}.`,
+                (deps.getTerminalBackendKind() === "herdr-core"
+                  ? `Core terminal: ${running.surface}.`
+                  : `Herdr target (once detected): herdr agent read ${running.herdrAgentName ?? running.surface}.`),
             },
           ],
           structuredContent: startedContent(running),
@@ -2022,7 +2051,7 @@ export default function subagentsExtension(pi: ExtensionAPI, dependencies: Parti
           structuredContent: { agents: list.map((agent) => ({
             name: agent.name, source: agent.source,
             ...(agent.description ? { description: agent.description } : {}),
-            ...(resolveModelDefault(agent.name, agent.model, modelConfig) ? { model: resolveModelDefault(agent.name, agent.model, modelConfig)! } : {}),
+            ...(resolveModelDefault(agent.name, agent.model, config.models) ? { model: resolveModelDefault(agent.name, agent.model, config.models)! } : {}),
             ...(agent.thinking ? { thinking: agent.thinking } : {}),
           })) },
         };
@@ -2053,13 +2082,13 @@ export default function subagentsExtension(pi: ExtensionAPI, dependencies: Parti
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new herdr pane. " +
+        "Resume a previous sub-agent session in a new terminal. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
-      promptSnippet: "Resume a previous sub-agent session in a herdr pane (async, result steered back).",
+      promptSnippet: "Resume a previous sub-agent session in a terminal (async, result steered back).",
       outputSchema: StartedSchema,
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
@@ -2128,7 +2157,7 @@ export default function subagentsExtension(pi: ExtensionAPI, dependencies: Parti
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const running = await launchInOwnedPane(name, params.message ?? "resumed session", `pi · ${name}`,
-          ctx.cwd, sessionId, deps, { kind: "resume", entryCountBefore }, async (surface, assertCurrent) => {
+          ctx.cwd, sessionId, deps, { kind: "resume", entryCountBefore }, async (surface, assertCurrent, submitScript) => {
             // Build pi resume command
             const parts = ["pi", "--session", shellQuote(params.sessionPath)];
 
@@ -2166,7 +2195,7 @@ export default function subagentsExtension(pi: ExtensionAPI, dependencies: Parti
               `${slugifyName(name, "resume")}-resume-${Date.now()}.sh`,
             );
             assertCurrent();
-            await deps.runScriptInPaneAsync(surface, command, {
+            await submitScript(surface, command, {
               scriptPath: launchScriptFile,
               scriptPreamble: [
                 `# Subagent resume script for ${name}`,

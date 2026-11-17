@@ -37,7 +37,8 @@ export interface SubagentLaunchContext {
   effectiveModel?: string;
   effectiveThinking?: ThinkingLevel;
   parentThinking: ThinkingLevel;
-  surface: string;
+  /** TUI pane known before launch; core binds its surface inside the script. */
+  surface?: string;
   artifactDir: string;
   sessionDir: string;
   subagentSessionFile: string;

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -15,6 +16,7 @@ import {
   createHerdrSurface,
   createHerdrSurfaceSplit,
   isHerdrAvailable,
+  getHerdrParentPaneId,
   readHerdrScreen,
   readHerdrScreenAsync,
   inspectHerdrPane,
@@ -25,26 +27,41 @@ import {
   sendHerdrEscape,
   sendHerdrEscapeAsync,
 } from "./herdr.ts";
+import { createCoreBackend } from "./herdr-core.ts";
+import type { PaneInspection } from "./lifecycle.ts";
 
 export type PaneId = string;
 export type SplitDirection = "right" | "down";
-
-/**
- * Where a subagent surface should be created:
- *   - `"tab"`   — a brand-new tab (default)
- *   - `"right"` — split the orchestrator pane to the right
- *   - `"down"`  — split the orchestrator pane below
- */
 export type SubagentLayout = "tab" | "auto" | SplitDirection;
+export type TerminalBackendKind = "herdr-tui" | "herdr-core";
 
-const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
+export interface TerminalLaunchRequest {
+  readonly name: string;
+  readonly task: string;
+  readonly cwd: string;
+  readonly layout: SubagentLayout;
+  readonly command: string;
+  readonly scriptPath: string;
+  readonly preamble?: string;
+}
 
-/**
- * Parse the `PI_SUBAGENT_LAYOUT` env var into a {@link SubagentLayout}.
- * Accepted values (case-sensitive, trimmed): `split`, `split:right` (both map
- * to a right-hand split), `split:down` (split below). Anything else — unset,
- * empty, or unknown — falls back to the default `tab`.
- */
+export interface TerminalBackend {
+  readonly kind: TerminalBackendKind;
+  readonly isAvailable: () => boolean;
+  readonly launch: (request: TerminalLaunchRequest) => Promise<PaneId>;
+  readonly send: (paneId: PaneId, command: string) => void;
+  readonly interrupt: (paneId: PaneId) => void;
+  readonly read: (paneId: PaneId, lines: number) => string;
+  readonly readAsync: (paneId: PaneId, lines: number) => Promise<string>;
+  readonly inspect: (paneId: PaneId) => Promise<PaneInspection>;
+  readonly close: (paneId: PaneId) => void;
+  readonly setTask: (paneId: PaneId, task: string) => void;
+  readonly renameTab: (title: string) => void;
+  readonly renameWorkspace: (title: string) => void;
+}
+
+const SETUP_HINT = "Start pi inside herdr-tui (`herdr`, then `pi`) or herdr-core (`hc run pi`). PI_SUBAGENT_BACKEND=herdr-tui or herdr-core optionally overrides automatic host selection.";
+
 export function parseSubagentLayout(raw?: string): SubagentLayout {
   const value = (raw ?? "").trim();
   if (value === "split" || value === "split:right") return "right";
@@ -53,19 +70,26 @@ export function parseSubagentLayout(raw?: string): SubagentLayout {
   return "tab";
 }
 
-/** Read `PI_SUBAGENT_LAYOUT` from the provided environment (defaults to the process env). */
 export function resolveSubagentLayout(env: Record<string, string | undefined> = process.env): SubagentLayout {
   return parseSubagentLayout(env.PI_SUBAGENT_LAYOUT);
 }
 
-/** Create the surface for a subagent according to the requested layout. */
+function createTuiSurface(name: string, layout: SubagentLayout, cwd: string): PaneId {
+  if (layout !== "tab") {
+    const parentPaneId = getHerdrParentPaneId();
+    if (parentPaneId) return createHerdrSurfaceSplit(name, layout === "auto" ? "right" : layout, parentPaneId, cwd);
+  }
+  return createHerdrSurface(name, cwd);
+}
+
+/** Two-phase surface creation is TUI-only; core launches the script directly. */
 export function createSubagentSurface(name: string, layout: SubagentLayout = "tab", cwd = process.cwd()): PaneId {
-  assertTerminalAvailable();
-  return layout === "tab" ? createSubagentPane(name, cwd) : splitCurrentPane(name, layout === "auto" ? "right" : layout, cwd);
+  if (assertTerminalAvailable().kind !== "herdr-tui") throw new Error("Use launchSubagentTerminal for herdr-core");
+  return createTuiSurface(name, layout, cwd);
 }
 
 export async function createSubagentSurfaceAsync(name: string, layout: SubagentLayout = "tab", cwd = process.cwd()): Promise<PaneId> {
-  assertTerminalAvailable();
+  if (assertTerminalAvailable().kind !== "herdr-tui") throw new Error("Use launchSubagentTerminal for herdr-core");
   if (layout === "tab") return createHerdrSurfaceAsync(name, cwd);
   let direction: SplitDirection = layout === "auto" ? "right" : layout;
   if (layout === "auto" && process.env.HERDR_PANE_ID) {
@@ -82,12 +106,16 @@ export function resolveAutoSplitDirection(layout: PaneLayout, pane = process.env
 }
 
 export async function closePaneAsync(pane: PaneId): Promise<void> {
-  assertTerminalAvailable();
-  await closeHerdrSurfaceAsync(pane);
+  const backend = assertTerminalAvailable();
+  if (backend.kind === "herdr-tui") await closeHerdrSurfaceAsync(pane);
+  else backend.close(pane);
 }
 
 export async function setPaneTaskAsync(pane: PaneId, task: string, displayAgent?: string): Promise<void> {
-  if (isTerminalAvailable()) await reportHerdrPaneMetadataAsync(pane, { task, displayAgent });
+  if (!isTerminalAvailable()) return;
+  const backend = getTerminalBackend();
+  if (backend.kind === "herdr-tui") await reportHerdrPaneMetadataAsync(pane, { task, displayAgent });
+  else backend.setTask(pane, task);
 }
 
 function envMilliseconds(value: string | undefined, fallback: number): number {
@@ -124,7 +152,6 @@ export async function waitForShellReady(pane: PaneId, options: { timeoutMs?: num
     idleSamples = isShellIdle(info) ? idleSamples + 1 : 0;
     if (idleSamples >= 2) {
       await deps.delay(Math.max(settle, floor - (deps.now() - started)));
-      // Shell startup can briefly return to its own process group between jobs.
       // Recheck after settling rather than sending into a newly started init job.
       try {
         if (isShellIdle(await deps.inspect(pane, 1000))) return;
@@ -139,77 +166,162 @@ export async function waitForShellReady(pane: PaneId, options: { timeoutMs?: num
   throw new Error(`Shell in ${pane} did not become ready within ${timeout}ms; command not submitted`);
 }
 
+function createTuiBackend(): TerminalBackend {
+  return Object.freeze({
+    kind: "herdr-tui",
+    isAvailable: isHerdrAvailable,
+    async launch(request) {
+      const paneId = await createSubagentSurfaceAsync(request.name, request.layout, request.cwd);
+      try {
+        await reportHerdrPaneMetadataAsync(paneId, { task: request.task });
+        await waitForShellReady(paneId);
+        await sendHerdrCommandAsync(paneId, `PI_SUBAGENT_SURFACE=${shellQuote(paneId)} bash ${shellQuote(request.scriptPath)}`);
+        return paneId;
+      } catch (error) {
+        await closeHerdrSurfaceAsync(paneId);
+        throw error;
+      }
+    },
+    send: sendHerdrCommand,
+    interrupt: sendHerdrEscape,
+    read: readHerdrScreen,
+    readAsync: readHerdrScreenAsync,
+    async inspect(paneId) {
+      const result = await inspectHerdrPane(paneId);
+      return result.kind === "present" ? { ...result, observedAt: Date.now() } : result;
+    },
+    close: closeHerdrSurface,
+    setTask: reportHerdrPaneTask,
+    renameTab: renameHerdrTab,
+    renameWorkspace: renameHerdrWorkspace,
+  } satisfies TerminalBackend);
+}
+
+function detectOwningBackend(): TerminalBackendKind | undefined {
+  const probe = (bin: string, args: string[]) => execFileSync(bin, args, {
+    encoding: "utf8", timeout: 1000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const candidates = new Map<number, TerminalBackendKind>();
+  for (const bin of ["hc", "herdr-core"]) {
+    try {
+      const record = JSON.parse(probe(bin, ["get", process.env.HC_TERMINAL_ID!, "--json"]));
+      if (record.address === process.env.HC_TERMINAL_ID && record.state === "live" && Number.isSafeInteger(record.pid) && record.pid > 0) {
+        candidates.set(record.pid, "herdr-core");
+      }
+      break;
+    } catch {}
+  }
+  if (process.env.HERDR_PANE_ID) {
+    try {
+      const record = JSON.parse(probe("herdr", ["pane", "process-info", "--pane", process.env.HERDR_PANE_ID]));
+      const pid = record?.result?.process_info?.shell_pid;
+      if (Number.isSafeInteger(pid) && pid > 0 && !candidates.has(pid)) candidates.set(pid, "herdr-tui");
+    } catch {}
+  }
+  if (!candidates.size) return undefined;
+  try {
+    const parents = new Map(probe("ps", ["-axo", "pid=,ppid="]).trim().split("\n").map((line) => {
+      const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+      return [pid, ppid] as const;
+    }));
+    const visited = new Set<number>();
+    for (let pid = process.pid; pid > 0 && !visited.has(pid); pid = parents.get(pid) ?? 0) {
+      const kind = candidates.get(pid);
+      if (kind) return kind;
+      visited.add(pid);
+    }
+  } catch {}
+  return undefined;
+}
+
+let selectedBackend: TerminalBackend | undefined;
+let selectionError: Error | undefined;
+
+export function getTerminalBackend(): TerminalBackend {
+  if (selectionError) throw selectionError;
+  if (selectedBackend) return selectedBackend;
+  const override = process.env.PI_SUBAGENT_BACKEND;
+  const core = Boolean(process.env.HC_TERMINAL_ID);
+  const tui = process.env.HERDR_ENV === "1";
+  if (override !== undefined && override !== "herdr-tui" && override !== "herdr-core") {
+    selectionError = new Error(`Cannot select terminal backend. ${SETUP_HINT}`);
+    throw selectionError;
+  }
+  const kind = override ?? (core && tui ? detectOwningBackend() : undefined) ?? (core ? "herdr-core" : "herdr-tui");
+  selectedBackend = kind === "herdr-core" ? createCoreBackend() : createTuiBackend();
+  return selectedBackend;
+}
+
 export function isTerminalAvailable(): boolean {
-  return isHerdrAvailable();
+  try { return getTerminalBackend().isAvailable(); }
+  catch { return false; }
 }
 
 export function terminalSetupHint(): string {
-  return SETUP_HINT;
+  return selectionError?.message ?? SETUP_HINT;
 }
 
-function assertTerminalAvailable(): void {
-  if (!isTerminalAvailable()) throw new Error(`herdr is not available. ${SETUP_HINT}`);
+function assertTerminalAvailable(): TerminalBackend {
+  const backend = getTerminalBackend();
+  if (!backend.isAvailable()) throw new Error(`${backend.kind} is not available. ${SETUP_HINT}`);
+  return backend;
 }
 
 export function shellQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
-/** Create a new herdr tab and return its root pane ID. */
-export function createSubagentPane(name: string, cwd = process.cwd()): PaneId {
-  assertTerminalAvailable();
-  return createHerdrSurface(name, cwd);
+function writeScript(scriptPath: string, command: string, preamble?: string): void {
+  mkdirSync(dirname(scriptPath), { recursive: true });
+  writeFileSync(scriptPath, ["#!/bin/bash", preamble?.trimEnd(), command, ""].filter((line) => line !== undefined).join("\n"), { mode: 0o755 });
 }
 
-/** Split the current herdr pane and return the child pane ID. */
+export async function launchSubagentTerminal(request: TerminalLaunchRequest): Promise<PaneId> {
+  const backend = assertTerminalAvailable();
+  const bindings = [
+    `export PI_SUBAGENT_BACKEND=${shellQuote(backend.kind)}`,
+    backend.kind === "herdr-core"
+      ? 'export PI_SUBAGENT_SURFACE="$HC_TERMINAL_ID"'
+      : "export PI_SUBAGENT_SURFACE",
+  ];
+  writeScript(request.scriptPath, request.command, [...bindings, request.preamble].filter(Boolean).join("\n"));
+  return backend.launch(request);
+}
+
+export function createSubagentPane(name: string, cwd = process.cwd()): PaneId {
+  return createSubagentSurface(name, "tab", cwd);
+}
+
 export function splitCurrentPane(name: string, direction: SplitDirection, cwd = process.cwd()): PaneId {
-  assertTerminalAvailable();
-  return createHerdrSurfaceSplit(name, direction, cwd);
+  return createSubagentSurface(name, direction, cwd);
 }
 
 export function renameCurrentTab(title: string): void {
-  assertTerminalAvailable();
-  renameHerdrTab(title);
+  assertTerminalAvailable().renameTab(title);
 }
 
 export function renameCurrentWorkspace(title: string): void {
-  assertTerminalAvailable();
-  renameHerdrWorkspace(title);
+  assertTerminalAvailable().renameWorkspace(title);
 }
 
 export function runInPane(paneId: PaneId, command: string): void {
-  assertTerminalAvailable();
-  sendHerdrCommand(paneId, command);
+  assertTerminalAvailable().send(paneId, command);
 }
 
 export function interruptPane(paneId: PaneId): void {
-  assertTerminalAvailable();
-  sendHerdrEscape(paneId);
+  assertTerminalAvailable().interrupt(paneId);
 }
 
 export async function interruptPaneAsync(pane: PaneId): Promise<void> {
-  assertTerminalAvailable();
-  await sendHerdrEscapeAsync(pane);
+  const backend = assertTerminalAvailable();
+  if (backend.kind === "herdr-tui") await sendHerdrEscapeAsync(pane);
+  else backend.interrupt(pane);
 }
 
-function writePaneScript(
-  command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
-): string {
-  const scriptPath =
-    options?.scriptPath ??
-    join(
-      tmpdir(),
-      "pi-herdr-subagent-scripts",
-      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-    );
-  mkdirSync(dirname(scriptPath), { recursive: true });
-
-  const scriptLines = ["#!/bin/bash"];
-  if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
-  scriptLines.push(command);
-  writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
-
+function writePaneScript(command: string, options?: { scriptPath?: string; scriptPreamble?: string }): string {
+  const scriptPath = options?.scriptPath ?? join(tmpdir(), "pi-herdr-subagent-scripts", `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`);
+  const bindings = `export PI_SUBAGENT_BACKEND=${shellQuote(getTerminalBackend().kind)}`;
+  writeScript(scriptPath, command, [bindings, options?.scriptPreamble].filter(Boolean).join("\n"));
   return scriptPath;
 }
 
@@ -220,39 +332,31 @@ export function runScriptInPane(paneId: PaneId, command: string, options?: { scr
 }
 
 export async function runScriptInPaneAsync(paneId: PaneId, command: string, options?: { scriptPath?: string; scriptPreamble?: string }): Promise<string> {
-  assertTerminalAvailable();
+  const backend = assertTerminalAvailable();
   const path = writePaneScript(command, options);
-  await sendHerdrCommandAsync(paneId, `bash ${shellQuote(path)}`);
+  if (backend.kind === "herdr-tui") await sendHerdrCommandAsync(paneId, `bash ${shellQuote(path)}`);
+  else backend.send(paneId, `bash ${shellQuote(path)}`);
   return path;
 }
 
 export function readPane(paneId: PaneId, lines = 50): string {
-  assertTerminalAvailable();
-  return readHerdrScreen(paneId, lines);
+  return assertTerminalAvailable().read(paneId, lines);
 }
 
 export async function readPaneAsync(paneId: PaneId, lines = 50): Promise<string> {
-  assertTerminalAvailable();
-  return readHerdrScreenAsync(paneId, lines);
+  return assertTerminalAvailable().readAsync(paneId, lines);
 }
 
 export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
 
-export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.ts").PaneInspection> {
-  assertTerminalAvailable();
-  const result = await inspectHerdrPane(paneId);
-  if (result.kind === "present") {
-    return { kind: "present", observedAt: Date.now(), ...result };
-  }
-  return result;
+export async function inspectPane(paneId: PaneId): Promise<PaneInspection> {
+  return assertTerminalAvailable().inspect(paneId);
 }
 
 export function closePane(paneId: PaneId): void {
-  assertTerminalAvailable();
-  closeHerdrSurface(paneId);
+  assertTerminalAvailable().close(paneId);
 }
 
 export function setPaneTask(paneId: PaneId, task: string): void {
-  if (!isTerminalAvailable()) return;
-  reportHerdrPaneTask(paneId, task);
+  if (isTerminalAvailable()) getTerminalBackend().setTask(paneId, task);
 }

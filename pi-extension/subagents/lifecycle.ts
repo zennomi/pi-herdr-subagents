@@ -20,6 +20,7 @@ export type PaneInspection =
       agent?: string;
       agentSession?: HerdrAgentSession;
       agentStatus: HerdrAgentStatus;
+      ended?: boolean;
       observedAt: number;
     }
   | { kind: "missing"; error?: string }

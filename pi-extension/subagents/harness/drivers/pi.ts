@@ -52,7 +52,7 @@ export function buildPiSubagentEnv(options: {
   sessionFile: string;
   id: string;
   activityFile: string;
-  surface: string;
+  surface?: string;
   autoExit: boolean;
   agentDir?: string;
   denyTools?: ReadonlySet<string>;
@@ -66,7 +66,7 @@ export function buildPiSubagentEnv(options: {
     PI_SUBAGENT_SESSION: options.sessionFile,
     PI_SUBAGENT_ID: options.id,
     PI_SUBAGENT_ACTIVITY_FILE: options.activityFile,
-    PI_SUBAGENT_SURFACE: options.surface,
+    ...(options.surface ? { PI_SUBAGENT_SURFACE: options.surface } : {}),
   };
   return [
     ...Object.entries(env).map(([key, value]) => `${key}=${options.quote(value)}`),
@@ -185,7 +185,6 @@ export class PiHarnessDriver implements HarnessDriver {
         `# Subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
         `# Session: ${subagentSessionFile}`,
-        `# Surface: ${surface}`,
         `# Runtime: ${runtimePlan.model} (thinking: ${runtimePlan.thinking})`,
       ],
     };

@@ -128,6 +128,12 @@ describe("Pi Harness Driver", () => {
   });
   const driver = new PiHarnessDriver();
 
+  it("leaves core surface binding to the launch script", () => {
+    const built = driver.buildCommand(createMockLaunchContext({ surface: undefined }));
+    assert.ok(!built.command.includes("PI_SUBAGENT_SURFACE="));
+    assert.ok(built.command.includes("PI_SUBAGENT_ID='abc12345'"));
+  });
+
   it("formats model using full provider/model reference", () => {
     assert.equal(
       driver.formatModel({ provider: "anthropic", modelId: "claude-sonnet-4-5", model: "anthropic/claude-sonnet-4-5" }),

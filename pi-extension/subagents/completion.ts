@@ -6,6 +6,7 @@ const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 export interface CompletionResult {
   reason: "done" | "ping" | "sentinel" | "error";
   exitCode: number;
+  keepOpen?: boolean;
   ping?: { name: string; message: string };
   errorMessage?: string;
 }
@@ -28,6 +29,7 @@ export interface CompletionOptions {
 export function interpretExitSidecar(data: unknown): CompletionResult {
   const payload = data as {
     type?: unknown;
+    keepOpen?: unknown;
     name?: unknown;
     message?: unknown;
     errorMessage?: unknown;
@@ -49,10 +51,19 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
       typeof payload.errorMessage === "string" && payload.errorMessage.trim()
         ? payload.errorMessage
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
+    return {
+      reason: "error", exitCode: 1, errorMessage,
+      ...(typeof payload.keepOpen === "boolean" ? { keepOpen: payload.keepOpen } : {}),
+    };
   }
 
-  if (payload?.type === "done") return { reason: "done", exitCode: 0 };
+  if (payload?.type === "done") {
+    return {
+      reason: "done",
+      exitCode: 0,
+      ...(typeof payload.keepOpen === "boolean" ? { keepOpen: payload.keepOpen } : {}),
+    };
+  }
 
   return {
     reason: "error",
@@ -105,6 +116,10 @@ async function waitForDisappearanceArtifacts(
     await abortableDelay(Math.min(25, remaining), signal);
     const result = completionArtifact(options);
     if (result) return result;
+    try {
+      const exitCode = terminalExitCode(await options.readTerminalTail());
+      if (exitCode !== null) return { reason: "sentinel", exitCode };
+    } catch {}
   }
   return null;
 }
@@ -158,15 +173,15 @@ export async function waitForCompletion(
       }
       const observedAt = Date.now();
       options.onPaneInspection?.(inspection, observedAt);
-      if (inspection.kind === "missing") {
-        // Pane closure and atomic artifact publication are separate operations.
-        // Allow a short bounded grace window before declaring evidence lost.
+      if (inspection.kind === "missing" || (inspection.kind === "present" && inspection.ended)) {
         const racedCompletion = await waitForDisappearanceArtifacts(signal, options);
         if (racedCompletion) return racedCompletion;
         return {
           reason: "error",
           exitCode: 1,
-          errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
+          errorMessage: inspection.kind === "missing"
+            ? "Subagent pane disappeared before completion evidence was recorded."
+            : "Subagent program ended before completion evidence was recorded.",
         };
       }
     }

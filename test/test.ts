@@ -61,6 +61,7 @@ import subagentDoneExtension, {
   buildCompletionSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import { getBehaviorConfig } from "../pi-extension/subagents/config.ts";
 import {
   createLifecycle,
   lifecycleTransition,
@@ -1525,6 +1526,79 @@ describe("subagent-done.ts", () => {
     shortcuts[0].handler(ctx);
     await registeredCommands.find((c) => c.name === "subagent-tools").handler("", ctx);
     assert.equal(updates, 2);
+  });
+
+  describe("keep-open lifecycle", () => {
+    for (const [closeOnDone, close, keepOpen] of [[true, false, true], [false, undefined, true], [false, true, false]]) {
+      it(`subagent_done honors close=${close} over config closeOnDone=${closeOnDone}`, async () => {
+        await withTempDirAsync(async (dir) => {
+          const previousSession = process.env.PI_SUBAGENT_SESSION;
+          const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+          const behavior = getBehaviorConfig();
+          const previousClose = behavior.closeOnDone;
+          const sessionFile = join(dir, "child.jsonl");
+          process.env.PI_SUBAGENT_SESSION = sessionFile;
+          process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+          behavior.closeOnDone = closeOnDone!;
+          try {
+            const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+            subagentDoneExtension(api);
+            let shutdowns = 0;
+            const ctx = { shutdown: () => shutdowns++ };
+            await registeredTools.find((tool) => tool.name === "subagent_done").execute("done", { close }, undefined, undefined, ctx);
+            const expected = { type: "done", ...(keepOpen ? { keepOpen: true } : {}) };
+            assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), expected);
+            assert.equal(interpretExitSidecar(expected).keepOpen === true, keepOpen);
+            eventHandlers.get("agent_end")![0]({ messages: [{ role: "assistant", stopReason: "error" }] }, ctx);
+            eventHandlers.get("agent_settled")![0]({}, ctx);
+            assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), expected, "settling must not overwrite explicit completion");
+            assert.equal(shutdowns, keepOpen ? 0 : 1);
+          } finally {
+            behavior.closeOnDone = previousClose;
+            restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+            restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+          }
+        });
+      });
+    }
+
+    for (const stopReason of ["stop", "error"]) {
+      it(`auto-exit keep-open publishes ${stopReason} only after settling, once`, () => {
+        withTempDir((dir) => {
+          const previousSession = process.env.PI_SUBAGENT_SESSION;
+          const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+          const behavior = getBehaviorConfig();
+          const previousClose = behavior.closeOnDone;
+          const sessionFile = join(dir, "child.jsonl");
+          process.env.PI_SUBAGENT_SESSION = sessionFile;
+          process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+          behavior.closeOnDone = false;
+          try {
+            const { api, eventHandlers } = createMockExtensionApi();
+            subagentDoneExtension(api);
+            let shutdowns = 0;
+            const ctx = { shutdown: () => shutdowns++ };
+            const end = eventHandlers.get("agent_end")![0];
+            const settled = eventHandlers.get("agent_settled")![0];
+            end({ messages: [{ role: "assistant", stopReason }] }, ctx);
+            assert.equal(existsSync(`${sessionFile}.exit`), false);
+            settled({}, ctx);
+            const sidecar = readFileSync(`${sessionFile}.exit`, "utf8");
+            const completion = interpretExitSidecar(JSON.parse(sidecar));
+            assert.equal(completion.keepOpen, true);
+            assert.equal(completion.exitCode, stopReason === "error" ? 1 : 0);
+            end({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+            settled({}, ctx);
+            assert.equal(readFileSync(`${sessionFile}.exit`, "utf8"), sidecar);
+            assert.equal(shutdowns, 0);
+          } finally {
+            behavior.closeOnDone = previousClose;
+            restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+            restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+          }
+        });
+      });
+    }
   });
 
   describe("auto-exit lifecycle", () => {
